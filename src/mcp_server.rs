@@ -37,6 +37,8 @@ struct SearchArgs {
     query: String,
     #[schemars(description = "Maximum results to return, from 1 to 10; defaults to 5")]
     limit: Option<usize>,
+    #[schemars(description = "Number of matching results to skip; defaults to 0")]
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -65,6 +67,9 @@ struct SearchResponse {
 struct SearchMetadata {
     lookup_time_ms: u64,
     result_count: usize,
+    offset: usize,
+    next_offset: usize,
+    has_more: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,20 +142,30 @@ impl ArxivMcpServer {
             return Err(McpError::invalid_params("limit must be at least 1", None));
         }
         let limit = args.limit.unwrap_or(5).min(MAX_SEARCH_RESULTS);
+        let offset = args.offset.unwrap_or(0);
+        let query_limit = limit
+            .checked_add(1)
+            .ok_or_else(|| McpError::invalid_params("limit is too large", None))?;
         let mut stream = self
             .table
             .query()
             .full_text_search(FullTextSearchQuery::new(query.to_owned()))
             .select(Select::columns(&["paper_id", "text"]))
-            .limit(limit)
+            .limit(query_limit)
+            .offset(offset)
             .execute()
             .await
             .map_err(internal_error)?;
 
         let mut hits = Vec::new();
+        let mut has_more = false;
         while let Some(batch) = stream.next().await {
             let batch = batch.map_err(internal_error)?;
             for row in 0..batch.num_rows() {
+                if hits.len() == limit {
+                    has_more = true;
+                    break;
+                }
                 let paper_id = string_value(batch.column(0).as_ref(), row)
                     .map_err(internal_error)?
                     .unwrap_or_default();
@@ -168,11 +183,20 @@ impl ArxivMcpServer {
                     snippet_truncated,
                 });
             }
+            if has_more {
+                break;
+            }
         }
+        let next_offset = offset
+            .checked_add(hits.len())
+            .ok_or_else(|| McpError::invalid_params("offset is too large", None))?;
         let response = SearchResponse {
             metadata: SearchMetadata {
                 lookup_time_ms: started_at.elapsed().as_millis() as u64,
                 result_count: hits.len(),
+                offset,
+                next_offset,
+                has_more,
             },
             results: hits,
         };

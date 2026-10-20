@@ -94,6 +94,8 @@ button { cursor: pointer; }
 .empty-state { padding: 22px 0; color: #333; }
 .empty-state h2 { margin: 0 0 5px; font-size: 16px; }
 .empty-state p { margin: 0; color: var(--muted); font-size: 12px; }
+.load-more { display: block; margin: 16px auto; padding: 8px 18px; border: 1px solid var(--accent); border-radius: 3px; color: var(--accent); background: #fff; }
+.load-more:disabled { opacity: .55; cursor: default; }
 .error-box { margin: 8px 0; padding: 8px 10px; border: 1px solid #c66; color: #722; background: #fff7f7; font-size: 13px; }
 .footer { padding: 10px 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
 

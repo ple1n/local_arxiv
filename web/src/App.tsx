@@ -27,6 +27,9 @@ type SearchResponse = {
   metadata: {
     lookup_time_ms: number;
     result_count: number;
+    offset: number;
+    next_offset: number;
+    has_more: boolean;
   };
 };
 
@@ -331,6 +334,8 @@ function App() {
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [lookupTimeMs, setLookupTimeMs] = useState<number | null>(null);
+  const [nextOffset, setNextOffset] = useState(0);
+  const [hasMore, setHasMore] = useState(false);
   const [selected, setSelected] = useState<PaperText | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -378,8 +383,7 @@ function App() {
     };
   }, []);
 
-  async function search(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  async function fetchSearchPage(offset: number, append: boolean) {
     const client = clientRef.current;
     if (!client || !query.trim()) return;
 
@@ -389,20 +393,36 @@ function App() {
     try {
       const response = await client.callTool({
         name: "search_full_text",
-        arguments: { query: query.trim(), limit: 10 },
+        arguments: { query: query.trim(), limit: 10, offset },
       });
       const searchResponse = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
       ) as SearchResponse;
-      setHits(searchResponse.results);
+      setHits((current) => append ? [...current, ...searchResponse.results] : searchResponse.results);
       setLookupTimeMs(searchResponse.metadata.lookup_time_ms);
+      setNextOffset(searchResponse.metadata.next_offset);
+      setHasMore(searchResponse.metadata.has_more);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
-      setHits([]);
-      setLookupTimeMs(null);
+      if (!append) {
+        setHits([]);
+        setLookupTimeMs(null);
+        setNextOffset(0);
+        setHasMore(false);
+      }
     } finally {
       setBusy(false);
     }
+  }
+
+  async function search(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setSelected(null);
+    await fetchSearchPage(0, false);
+  }
+
+  async function loadMore() {
+    await fetchSearchPage(nextOffset, true);
   }
 
   async function openPaper(paperId: string) {
@@ -505,6 +525,11 @@ function App() {
                 </div>
               </article>
             ))}
+            {hasMore && (
+              <button className="load-more" onClick={() => void loadMore()} disabled={busy}>
+                {busy ? "Loading…" : "Load more"}
+              </button>
+            )}
             {!hits.length && !busy && !error && (
               <div className="empty-state">
                 <div className="empty-symbol">⌘</div>
