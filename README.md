@@ -54,7 +54,11 @@ and access-control layer before binding to a non-loopback interface.
   short snippets plus available title/author/category/DOI metadata.
   `limit` is capped at 10. The response includes `results` and `metadata`
   (`lookup_time_ms`, `result_count`, `offset`, `next_offset`, and `has_more`).
-  Use `offset` with `limit` to paginate through matching results.
+  It also includes `search_url`, a page URL that reproduces the request.
+  Use `offset` with `limit` to paginate through matching results. The page
+  accepts `tool=search_full_text&query=...&limit=...&offset=...` and
+  `tool=get_paper_text&paper_id=...&max_chars=...` URL parameters to replay
+  those MCP requests.
 - `get_paper_text(paper_id, max_chars?)`: return stored paper text, capped at
   12,000 characters per call by default and at most, along with available
   metadata.

@@ -57,9 +57,13 @@ button { cursor: pointer; }
 .render-toggle { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .render-toggle input { margin: 0; }
 .results-section { min-height: 220px; padding-bottom: 20px; }
-.results-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.results-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
+.results-summary, .results-actions { display: flex; min-width: 0; align-items: center; gap: 10px; }
 .results-heading h2 { margin: 0; font-size: 16px; font-weight: 600; }
-.query-chip { max-width: 55%; overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.lookup-time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.query-chip { max-width: 360px; overflow: hidden; padding: 5px 9px; border: 1px solid #e4e4e4; border-radius: 999px; color: #525252; background: #f7f7f7; font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.results-link { display: inline-flex; align-items: center; gap: 5px; padding: 6px 10px; border: 1px solid #cbd8d2; border-radius: 4px; color: var(--accent); background: #fff; font-size: 11px; font-weight: 600; text-decoration: none; white-space: nowrap; }
+.results-link:hover { border-color: var(--accent); background: #f4f8f6; }
 .result-list { min-width: 0; }
 .paper-card { padding: 12px 0; border-bottom: 1px solid var(--line); }
 .paper-card.selected { border-left: 3px solid var(--accent); padding-left: 10px; }
@@ -104,4 +108,7 @@ button { cursor: pointer; }
   .hero { padding-top: 14px; }
   .paper-title { font-size: 15px; }
   .paper-reader { padding-right: 8px; padding-left: 8px; }
+  .results-heading { align-items: flex-start; flex-direction: column; gap: 9px; }
+  .results-actions { width: 100%; justify-content: space-between; }
+  .query-chip { max-width: calc(100% - 130px); }
 }

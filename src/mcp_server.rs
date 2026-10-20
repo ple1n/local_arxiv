@@ -61,6 +61,7 @@ struct SearchHit {
 struct SearchResponse {
     results: Vec<SearchHit>,
     metadata: SearchMetadata,
+    search_url: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,6 +192,10 @@ impl ArxivMcpServer {
             .checked_add(hits.len())
             .ok_or_else(|| McpError::invalid_params("offset is too large", None))?;
         let response = SearchResponse {
+            search_url: format!(
+                "/?tool=search_full_text&query={}&limit={limit}&offset={offset}",
+                Self::encode_query_parameter(query)
+            ),
             metadata: SearchMetadata {
                 lookup_time_ms: started_at.elapsed().as_millis() as u64,
                 result_count: hits.len(),
@@ -201,6 +206,19 @@ impl ArxivMcpServer {
             results: hits,
         };
         serde_json::to_string_pretty(&response).map_err(internal_error)
+    }
+
+    fn encode_query_parameter(value: &str) -> String {
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+                encoded.push(char::from(byte));
+            } else {
+                use std::fmt::Write;
+                write!(encoded, "%{byte:02X}").expect("writing to String cannot fail");
+            }
+        }
+        encoded
     }
 
     #[tool(description = "Retrieve the stored text of a paper by its arXiv paper_id.")]

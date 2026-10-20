@@ -24,6 +24,7 @@ type SearchHit = {
 
 type SearchResponse = {
   results: SearchHit[];
+  search_url: string;
   metadata: {
     lookup_time_ms: number;
     result_count: number;
@@ -329,9 +330,11 @@ const paperCss = `
 `;
 
 function App() {
+  const initialParams = new URLSearchParams(window.location.search);
   const clientRef = useRef<Client | null>(null);
   const transportRef = useRef<StreamableHTTPClientTransport | null>(null);
-  const [query, setQuery] = useState("");
+  const [query, setQuery] = useState(initialParams.get("query") ?? "");
+  const [searchUrl, setSearchUrl] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [lookupTimeMs, setLookupTimeMs] = useState<number | null>(null);
   const [nextOffset, setNextOffset] = useState(0);
@@ -364,6 +367,21 @@ function App() {
             metadata_rows: number;
           };
           setStatus(`Connected to :8000 · ${info.text_rows.toLocaleString()} papers · ${info.metadata_rows.toLocaleString()} metadata records`);
+          const tool = initialParams.get("tool");
+          if (tool === "search_full_text" && initialParams.get("query")) {
+            await fetchSearchPage(
+              Number.parseInt(initialParams.get("offset") ?? "0", 10) || 0,
+              false,
+              Number.parseInt(initialParams.get("limit") ?? "10", 10) || 10,
+              false,
+            );
+          } else if (tool === "get_paper_text" && initialParams.get("paper_id")) {
+            await openPaper(
+              initialParams.get("paper_id")!,
+              Number.parseInt(initialParams.get("max_chars") ?? "1000000", 10) || 1_000_000,
+              false,
+            );
+          }
         } catch (reason) {
           if (!active) return;
           setError(reason instanceof Error ? reason.message : String(reason));
@@ -383,7 +401,7 @@ function App() {
     };
   }, []);
 
-  async function fetchSearchPage(offset: number, append: boolean) {
+  async function fetchSearchPage(offset: number, append: boolean, limit = 10, updateUrl = true) {
     const client = clientRef.current;
     if (!client || !query.trim()) return;
 
@@ -393,7 +411,7 @@ function App() {
     try {
       const response = await client.callTool({
         name: "search_full_text",
-        arguments: { query: query.trim(), limit: 10, offset },
+        arguments: { query: query.trim(), limit, offset },
       });
       const searchResponse = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
@@ -402,6 +420,10 @@ function App() {
       setLookupTimeMs(searchResponse.metadata.lookup_time_ms);
       setNextOffset(searchResponse.metadata.next_offset);
       setHasMore(searchResponse.metadata.has_more);
+      setSearchUrl(new URL(searchResponse.search_url, window.location.origin).toString());
+      if (updateUrl) {
+        window.history.pushState(null, "", searchResponse.search_url);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       if (!append) {
@@ -425,7 +447,7 @@ function App() {
     await fetchSearchPage(nextOffset, true);
   }
 
-  async function openPaper(paperId: string) {
+  async function openPaper(paperId: string, maxChars = 1_000_000, updateUrl = true) {
     const client = clientRef.current;
     if (!client) return;
     setBusy(true);
@@ -433,11 +455,19 @@ function App() {
     try {
       const response = await client.callTool({
         name: "get_paper_text",
-        arguments: { paper_id: paperId, max_chars: 1_000_000 },
+        arguments: { paper_id: paperId, max_chars: maxChars },
       });
       setSelected(
         JSON.parse(getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean })) as PaperText,
       );
+      if (updateUrl) {
+        const params = new URLSearchParams({
+          tool: "get_paper_text",
+          paper_id: paperId,
+          max_chars: String(maxChars),
+        });
+        window.history.pushState(null, "", `/?${params.toString()}`);
+      }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -486,11 +516,14 @@ function App() {
         {error && <div className="error-box">{error}</div>}
         {hits.length > 0 && (
           <div className="results-heading">
-            <div>
+            <div className="results-summary">
               <h2>{hits.length} matching papers</h2>
-              {lookupTimeMs !== null && <span>{lookupTimeMs} ms lookup</span>}
+              {lookupTimeMs !== null && <span className="lookup-time">{lookupTimeMs} ms</span>}
             </div>
-            <span className="query-chip">{query}</span>
+            <div className="results-actions">
+              <span className="query-chip">{query}</span>
+              {searchUrl && <a className="results-link" href={searchUrl}>Share results <span aria-hidden="true">↗</span></a>}
+            </div>
           </div>
         )}
         <div className="results-grid">
