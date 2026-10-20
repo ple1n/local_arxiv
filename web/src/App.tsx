@@ -1,0 +1,563 @@
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import DOMPurify from "dompurify";
+import latexCss from "../node_modules/latex.js/dist/css/article.css?inline";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+
+type PaperMetadata = {
+  title?: string | null;
+  authors?: string | null;
+  abstract?: string | null;
+  categories?: string | null;
+  primary_category?: string | null;
+  doi?: string | null;
+  journal_ref?: string | null;
+  license?: string | null;
+};
+
+type SearchHit = {
+  paper_id: string;
+  metadata?: PaperMetadata | null;
+  snippet: string;
+  snippet_truncated: boolean;
+};
+
+type PaperText = {
+  paper_id: string;
+  metadata?: PaperMetadata | null;
+  text: string;
+  truncated: boolean;
+  returned_chars: number;
+  max_chars: number;
+};
+
+function getText(result: { content: Array<{ type: string; text?: string }>; isError?: boolean }) {
+  if (result.isError) {
+    throw new Error(result.content.map((item) => item.text ?? "").join("\n") || "MCP tool failed");
+  }
+  return result.content
+    .filter((item) => item.type === "text")
+    .map((item) => item.text ?? "")
+    .join("\n");
+}
+
+function HighlightText({ text, query }: { text: string; query: string }) {
+  const terms = query.trim().split(/\s+/).filter(Boolean).sort((a, b) => b.length - a.length);
+  if (!terms.length) return text;
+
+  const pattern = new RegExp(`(${terms.map(escapeRegExp).join("|")})`, "giu");
+  return text.split(pattern).map((part, index) =>
+    terms.some((term) => part.toLocaleLowerCase() === term.toLocaleLowerCase()) ? (
+      <mark className="query-match" key={`${part}-${index}`}>{part}</mark>
+    ) : (
+      part
+    ),
+  );
+}
+
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function LatexSnippet({ source, query, renderLatex }: { source: string; query: string; renderLatex: boolean }) {
+  const [html, setHtml] = useState("");
+
+  useEffect(() => {
+    if (!renderLatex) {
+      setHtml("");
+      return;
+    }
+    let cancelled = false;
+    void import("latex.js")
+      .then(({ HtmlGenerator, parse }) => {
+        let body: string | undefined;
+        for (const candidate of snippetDocuments(source)) {
+          try {
+            const document = renderWithLatexFallback(candidate, (normalized) =>
+              parse(normalized, {
+                generator: new HtmlGenerator({ hyphenate: false }),
+              }).htmlDocument(),
+            );
+            body = document.body.innerHTML;
+            break;
+          } catch {
+            continue;
+          }
+        }
+        if (!body) throw new Error("Could not render this excerpt with LaTeX.js");
+        body = highlightHtml(body, query);
+        const safeBody = DOMPurify.sanitize(body, {
+          FORBID_TAGS: ["script", "iframe", "object", "embed", "form"],
+        });
+        if (!cancelled) setHtml(snippetDocument(safeBody));
+      })
+      .catch(() => {
+        if (!cancelled) setHtml("");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [source, query, renderLatex]);
+
+  if (!renderLatex) {
+    return <span className="snippet-source"><HighlightText text={source.replace(/\s+/g, " ").trim()} query={query} /></span>;
+  }
+  if (!html) {
+    return <span className="snippet-source"><HighlightText text={source.replace(/\s+/g, " ").trim()} query={query} /></span>;
+  }
+  return <iframe className="snippet-frame" title="Rendered search excerpt" sandbox="allow-same-origin" srcDoc={html} />;
+}
+
+function PaperRenderer({ source, renderLatex }: { source: string; renderLatex: boolean }) {
+  const [rendered, setRendered] = useState<{ html: string; error: string }>({
+    html: "",
+    error: "",
+  });
+
+  useEffect(() => {
+    if (!renderLatex) return;
+    let cancelled = false;
+    setRendered({ html: "", error: "" });
+    void import("latex.js")
+      .then(({ HtmlGenerator, parse }) => {
+        const document = renderWithLatexFallback(source, (normalized) =>
+          parse(normalized, {
+            generator: new HtmlGenerator({ hyphenate: false }),
+          }).htmlDocument(),
+        );
+        const body = DOMPurify.sanitize(document.body.innerHTML, {
+          FORBID_TAGS: ["script", "iframe", "object", "embed", "form"],
+        });
+        if (!cancelled) {
+          setRendered({
+            html: paperDocument(body),
+            error: "",
+          });
+        }
+      })
+      .catch((reason: unknown) => {
+        if (!cancelled) {
+          setRendered({
+            html: "",
+            error: reason instanceof Error ? reason.message : String(reason),
+          });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [source, renderLatex]);
+
+  if (!renderLatex) {
+    return <pre className="paper-source">{source}</pre>;
+  }
+
+  if (rendered.error) {
+    return (
+      <div className="render-fallback">
+        <p>Could not render this source as a complete LaTeX document. Showing its source instead.</p>
+        <details>
+          <summary>LaTeX.js parser error</summary>
+          <pre>{rendered.error}</pre>
+        </details>
+        <pre className="paper-source">{source}</pre>
+      </div>
+    );
+  }
+
+  if (!rendered.html) {
+    return <div className="render-loading">Preparing the paper layout…</div>;
+  }
+
+  return (
+    <iframe
+      className="latex-frame"
+      title="Rendered paper"
+      sandbox="allow-same-origin"
+      srcDoc={rendered.html}
+    />
+  );
+}
+
+function toArticleDocument(source: string) {
+  const documentStart = source.indexOf("\\begin{document}");
+  const documentEnd = source.lastIndexOf("\\end{document}");
+  const bodyStart = documentStart + "\\begin{document}".length;
+  let body = documentStart < 0
+    ? source
+    : source.slice(bodyStart, documentEnd < bodyStart ? undefined : documentEnd);
+  const operators = [...source.matchAll(/\\DeclareMathOperator\*?\s*\{\\([A-Za-z]+)\}\s*\{([^{}]*)\}/g)];
+  for (const [, name, value] of operators) {
+    body = body.replace(new RegExp(`\\\\${escapeRegExp(name)}(?![A-Za-z])`, "g"), `\\mathrm{${value}}`);
+  }
+  body = body
+    .replace(/\\(?:cite[a-z]*|parencite|textcite|autocite)(?:\[[^\]]*\])*\s*\{([^{}]*)\}/gi, " [$1]")
+    .replace(/\\eqref\{([^{}]*)\}/g, "($1)")
+    .replace(/\\(?:ref|autoref|cref|Cref)\{([^{}]*)\}/g, "[$1]")
+    .replace(/\\(?:label|bibliography|bibliographystyle|addbibresource|nocite)\{[^{}]*\}/g, "")
+    .replace(/\\url\{([^{}]*)\}/g, "\\texttt{$1}")
+    .replace(/\\href\{[^{}]*\}\{([^{}]*)\}/g, "$1")
+    .replace(/\\includegraphics\*?(?:\[[^\]]*\])?\s*\{[^{}]*\}/g, "")
+    .replace(/\\begin\{thebibliography\}(?:\s*\{[^{}]*\})?[\s\S]*?\\end\{thebibliography\}/g, "")
+    .replace(/\\usepackage(?:\[[^\]]*\])?\{[^}]*\}/g, "");
+  return `\\documentclass{article}\n\\begin{document}\n${body}\n\\end{document}`;
+}
+
+function renderWithLatexFallback(source: string, parseDocument: (normalized: string) => Document) {
+  let normalized = toArticleDocument(source);
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 64; attempt++) {
+    try {
+      return parseDocument(normalized);
+    } catch (reason) {
+      lastError = reason;
+      const message = reason instanceof Error ? reason.message : String(reason);
+      const unknownMacro = /unknown macro: \\([A-Za-z]+)\b/.exec(message)?.[1];
+      const unknownEnvironment = /unknown environment: ([A-Za-z]+\*?)/.exec(message)?.[1];
+      let next = normalized;
+      if (unknownMacro) {
+        const pattern = new RegExp(`\\\\${escapeRegExp(unknownMacro)}(?![A-Za-z])`, "g");
+        next = normalized.replace(pattern, "");
+      } else if (unknownEnvironment) {
+        const env = escapeRegExp(unknownEnvironment);
+        const beginPattern = new RegExp(`\\\\begin\\{${env}\\}(?:\\s*\\[[^\\]]*\\])?(?:\\s*\\{[^{}]*\\})?`, "g");
+        const endPattern = new RegExp(`\\\\end\\{${env}\\}`, "g");
+        next = normalized.replace(beginPattern, "").replace(endPattern, "");
+      } else if (/\\end\{document\} missing/.test(message)) {
+        next = normalized
+          .replace(/\\begin\{(?!document\})[^}]+\}(?:\s*\[[^\]]*\])?(?:\s*\{[^{}]*\})?/g, "")
+          .replace(/\\end\{(?!document\})[^}]+\}/g, "");
+      } else {
+        throw reason;
+      }
+      if (next === normalized) throw reason;
+      normalized = next;
+    }
+  }
+  throw lastError ?? new Error("LaTeX.js could not parse the document");
+}
+
+function snippetDocuments(source: string) {
+  const normalized = source
+    .replace(/^\s*…/, "")
+    .replace(/…\s*$/, "")
+    .replace(/\\documentclass(?:\[[^\]]*\])?\{[^}]*\}/g, "")
+    .replace(/\\usepackage(?:\[[^\]]*\])?\{[^}]*\}/g, "")
+    .replace(/\\begin\{document\}/g, "")
+    .replace(/\\end\{document\}/g, "");
+  return [
+    source,
+    `\\documentclass{article}\\begin{document}${normalized}\\end{document}`,
+  ];
+}
+
+function highlightHtml(html: string, query: string) {
+  const terms = query.trim().split(/\s+/).filter(Boolean).sort((a, b) => b.length - a.length);
+  if (!terms.length) return html;
+
+  const expression = new RegExp(terms.map(escapeRegExp).join("|"), "giu");
+  const parsed = new DOMParser().parseFromString(html, "text/html");
+  const walker = parsed.createTreeWalker(parsed.body, NodeFilter.SHOW_TEXT);
+  const textNodes: Text[] = [];
+  while (walker.nextNode()) {
+    if (!walker.currentNode.parentElement?.closest("script,style,mark")) {
+      textNodes.push(walker.currentNode as Text);
+    }
+  }
+
+  for (const node of textNodes) {
+    const value = node.nodeValue ?? "";
+    expression.lastIndex = 0;
+    let match: RegExpExecArray | null;
+    let offset = 0;
+    const fragment = parsed.createDocumentFragment();
+    while ((match = expression.exec(value)) !== null) {
+      fragment.append(value.slice(offset, match.index));
+      const mark = parsed.createElement("mark");
+      mark.textContent = match[0];
+      fragment.append(mark);
+      offset = match.index + match[0].length;
+    }
+    if (offset > 0) {
+      fragment.append(value.slice(offset));
+      node.replaceWith(fragment);
+    }
+  }
+  return parsed.body.innerHTML;
+}
+
+function paperDocument(body: string) {
+  return `<!doctype html><html><head><meta charset="utf-8"><style>${latexCss}${paperCss}</style></head><body>${body}</body></html>`;
+}
+
+function snippetDocument(body: string) {
+  const compactStyle = `
+    html, body { overflow-x: hidden; scrollbar-width: none; }
+    *::-webkit-scrollbar { display: none; }
+    body { max-width: none; margin: 0; padding: 3px 5px; font: 12px/1.4 Georgia, serif; overflow-wrap: anywhere; word-break: break-word; }
+    p { margin: 0; text-align: left; }
+    h1, h2, h3, h4 { margin: 0; font-size: 1em; }
+    mark { background: #ffdf70; color: #111; }
+  `;
+  return `<!doctype html><html><head><meta charset="utf-8"><style>${latexCss}${compactStyle}</style></head><body>${body}</body></html>`;
+}
+
+const paperCss = `
+  html { background: #fff; color: #111; font: 16px/1.55 Georgia, "Times New Roman", serif; overflow-x: hidden; scrollbar-width: none; }
+  body { max-width: 1100px; margin: 0 auto; padding: 20px 30px 48px; overflow-x: hidden; overflow-wrap: anywhere; word-break: break-word; }
+  *::-webkit-scrollbar { display: none; }
+  h1, h2, h3, h4 { line-height: 1.25; margin: 1.25em 0 .45em; }
+  h1 { font-size: 1.65em; }
+  h2 { font-size: 1.35em; border-bottom: 1px solid #ddd; padding-bottom: .2em; }
+  h3 { font-size: 1.15em; }
+  p { margin: .65em 0; }
+  table { max-width: 100%; border-collapse: collapse; }
+  img, svg { max-width: 100%; height: auto; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word; }
+  @media (max-width: 700px) { body { padding: 16px 12px 36px; } }
+`;
+
+function App() {
+  const clientRef = useRef<Client | null>(null);
+  const transportRef = useRef<StreamableHTTPClientTransport | null>(null);
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<SearchHit[]>([]);
+  const [selected, setSelected] = useState<PaperText | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [status, setStatus] = useState("Connecting to :8000…");
+  const [renderLatex, setRenderLatex] = useState(false);
+
+  useEffect(() => {
+    if (!selected) return;
+    const previousOverflow = document.body.style.overflow;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setSelected(null);
+    };
+    document.body.style.overflow = "hidden";
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [selected]);
+
+  useEffect(() => {
+    let active = true;
+    const client = new Client({ name: "arxiv-search-ui", version: "0.1.0" });
+    const transport = new StreamableHTTPClientTransport(
+      new URL("http://127.0.0.1:8000/mcp"),
+    );
+    clientRef.current = client;
+    transportRef.current = transport;
+
+    void client
+      .connect(transport)
+      .then(async () => {
+        if (!active) return;
+        setStatus("Connected to :8000");
+        try {
+          const result = await client.callTool({ name: "dataset_status", arguments: {} });
+          if (!active) return;
+          const info = JSON.parse(getText(result as { content: Array<{ type: string; text?: string }>; isError?: boolean })) as {
+            text_rows: number;
+            metadata_rows: number;
+          };
+          setStatus(`Connected to :8000 · ${info.text_rows.toLocaleString()} papers · ${info.metadata_rows.toLocaleString()} metadata records`);
+        } catch (reason) {
+          if (!active) return;
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+      })
+      .catch((reason: unknown) => {
+        if (!active) return;
+        setError(reason instanceof Error ? reason.message : String(reason));
+        setStatus("Not connected to :8000");
+      });
+
+    return () => {
+      active = false;
+      void client.close();
+      clientRef.current = null;
+      transportRef.current = null;
+    };
+  }, []);
+
+  async function search(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const client = clientRef.current;
+    if (!client || !query.trim()) return;
+
+    setBusy(true);
+    setError("");
+    setSelected(null);
+    try {
+      const response = await client.callTool({
+        name: "search_full_text",
+        arguments: { query: query.trim(), limit: 10 },
+      });
+      setHits(
+        JSON.parse(getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean })) as SearchHit[],
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setHits([]);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function openPaper(paperId: string) {
+    const client = clientRef.current;
+    if (!client) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response = await client.callTool({
+        name: "get_paper_text",
+        arguments: { paper_id: paperId, max_chars: 1_000_000 },
+      });
+      setSelected(
+        JSON.parse(getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean })) as PaperText,
+      );
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <main className="page">
+      <header className="topbar">
+        <a className="brand" href="/" aria-label="ArXiv search home">
+          ArXiv search
+        </a>
+        <span className="connection"><i />{status}</span>
+      </header>
+
+      <section className="hero">
+        <h1>Full-text search</h1>
+        <form className="search-form" onSubmit={search}>
+          <input
+            aria-label="Search paper text"
+            autoFocus
+            placeholder="Search paper text"
+            value={query}
+            onChange={(event) => setQuery(event.target.value)}
+          />
+          <button type="submit" disabled={busy || !query.trim()}>
+            {busy ? "Searching…" : "Search"}
+            <span aria-hidden="true">↗</span>
+          </button>
+        </form>
+        <div className="search-note">
+          <span>Local index · Search results include matching text and metadata</span>
+          <label className="render-toggle">
+            <input
+              type="checkbox"
+              checked={renderLatex}
+              onChange={(event) => setRenderLatex(event.target.checked)}
+            />
+            Render LaTeX
+          </label>
+        </div>
+      </section>
+
+      <section className="results-section" aria-live="polite">
+        {error && <div className="error-box">{error}</div>}
+        {hits.length > 0 && (
+          <div className="results-heading">
+            <div>
+              <h2>{hits.length} matching papers</h2>
+            </div>
+            <span className="query-chip">{query}</span>
+          </div>
+        )}
+        <div className="results-grid">
+          <div className="result-list">
+            {hits.map((hit, index) => (
+              <article className={`paper-card ${selected?.paper_id === hit.paper_id ? "selected" : ""}`} key={hit.paper_id}>
+                <div className="card-topline">
+                  <span className="result-number">{index + 1}.</span>
+                  <button className="paper-id" onClick={() => void openPaper(hit.paper_id)}>{hit.paper_id} ↗</button>
+                </div>
+                <button className="paper-title" onClick={() => void openPaper(hit.paper_id)}>
+                  {hit.metadata?.title || "Untitled paper"}
+                </button>
+                <p className="authors">{hit.metadata?.authors || "Author information unavailable"}</p>
+                {hit.metadata?.abstract && (
+                  <p className="abstract"><LatexSnippet source={hit.metadata.abstract} query={query} renderLatex={renderLatex} /></p>
+                )}
+                <div className="snippet"><LatexSnippet source={hit.snippet} query={query} renderLatex={renderLatex} /></div>
+                <div className="card-footer">
+                  <span className="category">Category: {hit.metadata?.primary_category || hit.metadata?.categories || "unavailable"}</span>
+                  {hit.metadata?.journal_ref && <span>Journal: {hit.metadata.journal_ref}</span>}
+                  {hit.metadata?.doi && (
+                    <a href={`https://doi.org/${encodeURIComponent(hit.metadata.doi)}`} target="_blank" rel="noreferrer">
+                      DOI: {hit.metadata.doi}
+                    </a>
+                  )}
+                  {!hit.metadata?.doi && <span>DOI: unavailable</span>}
+                  {hit.metadata?.license && (
+                    <a href={hit.metadata.license} target="_blank" rel="noreferrer">License</a>
+                  )}
+                  <a href={`https://arxiv.org/abs/${encodeURIComponent(hit.paper_id)}`} target="_blank" rel="noreferrer">arXiv record</a>
+                </div>
+              </article>
+            ))}
+            {!hits.length && !busy && !error && (
+              <div className="empty-state">
+                <div className="empty-symbol">⌘</div>
+                <h2>Your next useful paper is in here.</h2>
+                <p>Search the local full-text index to see paper details and matching text.</p>
+              </div>
+            )}
+          </div>
+        </div>
+      </section>
+      <footer className="footer">A local research tool · Search results are limited to the data currently indexed</footer>
+      {selected && (
+        <div
+          className="reader-backdrop"
+          onClick={(event) => {
+            if (event.target === event.currentTarget) setSelected(null);
+          }}
+        >
+          <section className="paper-reader" role="dialog" aria-modal="true" aria-labelledby="reader-title">
+            <div className="reader-header">
+              <div>
+                <span className="eyebrow">{renderLatex ? "PAPER · " : "PAPER SOURCE · "}{selected.paper_id}</span>
+                <h2 id="reader-title">{selected.metadata?.title || selected.paper_id}</h2>
+              </div>
+              <button className="close-reader" onClick={() => setSelected(null)} aria-label="Close paper text">×</button>
+            </div>
+            <div className="reader-meta">
+              {selected.metadata?.authors && <span>{selected.metadata.authors}</span>}
+              {selected.metadata?.primary_category && <span>{selected.metadata.primary_category}</span>}
+              {selected.metadata?.journal_ref && <span>{selected.metadata.journal_ref}</span>}
+              {selected.metadata?.doi ? (
+                <a href={`https://doi.org/${encodeURIComponent(selected.metadata.doi)}`} target="_blank" rel="noreferrer">
+                  DOI: {selected.metadata.doi}
+                </a>
+              ) : (
+                <span>DOI unavailable</span>
+              )}
+              {selected.metadata?.license && (
+                <a href={selected.metadata.license} target="_blank" rel="noreferrer">License</a>
+              )}
+            </div>
+            <PaperRenderer source={selected.text} renderLatex={renderLatex} />
+            {selected.truncated && (
+              <p className="truncation-note">
+                This paper exceeds the 1,000,000-character reader limit; showing the first {selected.returned_chars.toLocaleString()} characters.
+              </p>
+            )}
+          </section>
+        </div>
+      )}
+    </main>
+  );
+}
+
+export default App;

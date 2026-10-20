@@ -1,0 +1,106 @@
+:root {
+  font-family: Arial, Helvetica, sans-serif;
+  color: #171717;
+  background: #fff;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --line: #d9d9d9;
+  --muted: #626262;
+  --accent: #075f48;
+}
+
+* { box-sizing: border-box; scrollbar-width: none; }
+*::-webkit-scrollbar { display: none; }
+html, body { overflow-x: hidden; }
+body { margin: 0; min-width: 320px; }
+button, input { font: inherit; }
+button { cursor: pointer; }
+.page { min-height: 100vh; }
+.topbar {
+  min-height: 48px;
+  padding: 0 max(16px, calc((100vw - 1280px) / 2));
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+}
+.brand { color: #111; font-size: 15px; font-weight: 700; text-decoration: none; }
+.connection { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
+.connection i { width: 7px; height: 7px; border-radius: 50%; background: #31845e; }
+.hero, .results-section { width: min(1280px, 100%); margin: 0 auto; padding: 0 16px; }
+.hero { padding-top: 20px; padding-bottom: 14px; }
+.hero h1 { margin: 0 0 10px; font-size: 23px; line-height: 1.25; font-weight: 600; }
+.search-form { display: flex; gap: 8px; width: 100%; }
+.search-form input {
+  flex: 1;
+  min-width: 0;
+  height: 42px;
+  padding: 0 11px;
+  border: 1px solid #999;
+  border-radius: 3px;
+  background: #fff;
+  font-size: 15px;
+}
+.search-form input:focus { outline: 2px solid #4b8d73; outline-offset: 1px; }
+.search-form button {
+  min-width: 88px;
+  padding: 0 16px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  color: #fff;
+  background: var(--accent);
+  font-size: 14px;
+}
+.search-form button:disabled { opacity: .55; cursor: default; }
+.search-note { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 6px; color: var(--muted); font-size: 11px; }
+.render-toggle { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+.render-toggle input { margin: 0; }
+.results-section { min-height: 220px; padding-bottom: 20px; }
+.results-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--line); }
+.results-heading h2 { margin: 0; font-size: 16px; font-weight: 600; }
+.query-chip { max-width: 55%; overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.result-list { min-width: 0; }
+.paper-card { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.paper-card.selected { border-left: 3px solid var(--accent); padding-left: 10px; }
+.card-topline { display: flex; justify-content: space-between; align-items: center; margin-bottom: 3px; }
+.result-number { color: var(--muted); font-size: 11px; }
+.paper-id { padding: 0; border: 0; color: var(--accent); background: transparent; font-size: 12px; }
+.paper-title { display: inline; padding: 0; border: 0; color: #111; background: transparent; text-align: left; font-size: 16px; line-height: 1.35; font-weight: 600; }
+.paper-title:hover, .paper-id:hover { text-decoration: underline; }
+.authors { margin: 3px 0 5px; color: var(--muted); font-size: 12px; }
+.abstract { margin: 4px 0; color: #292929; font-size: 13px; line-height: 1.45; }
+.snippet { max-height: 6em; overflow: hidden; margin: 6px 0; padding: 4px 7px; border-left: 2px solid #aaa; background: #f7f7f7; color: #222; }
+.snippet-frame { display: block; width: 100%; height: 6.5em; border: 0; background: #f7f7f7; }
+.abstract .snippet-frame { height: 5.5em; }
+.snippet-source { display: block; max-height: 6em; overflow: hidden; font: 12px/1.4 Georgia, serif; }
+.card-footer { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--muted); font-size: 11px; }
+.card-footer a { color: var(--accent); }
+.category { color: #315f4d; }
+.query-match { padding: 0 1px; color: #111; background: #ffdf70; }
+.reader-backdrop { position: fixed; z-index: 20; inset: 0; padding: 0; background: #fff; }
+.paper-reader { display: flex; flex-direction: column; width: 100%; height: 100vh; height: 100dvh; padding: 0 14px 10px; background: #fff; }
+.reader-header { min-height: 50px; display: flex; justify-content: space-between; align-items: center; gap: 15px; border-bottom: 1px solid var(--line); }
+.reader-header h2 { margin: 0; overflow: hidden; font-size: 15px; line-height: 1.35; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.eyebrow { display: block; margin-bottom: 2px; color: var(--muted); font-size: 10px; }
+.close-reader { flex: 0 0 34px; width: 34px; height: 34px; border: 1px solid #888; border-radius: 3px; color: #111; background: #fff; font-size: 22px; line-height: 1; }
+.reader-meta { display: flex; flex-wrap: wrap; gap: 3px 12px; padding: 5px 0; color: var(--muted); font-size: 11px; }
+.reader-meta a { color: var(--accent); }
+.latex-frame { width: 100%; flex: 1; min-height: 0; border: 1px solid var(--line); background: #fff; }
+.paper-source { flex: 1; min-height: 0; overflow: auto; margin: 0; padding: 12px; border: 1px solid var(--line); background: #f7f7f7; color: #111; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.render-fallback { flex: 1; min-height: 0; overflow: auto; }
+.render-fallback > p, .truncation-note { margin: 5px 0; color: #733; font-size: 12px; }
+.render-fallback pre { overflow: auto; padding: 12px; background: #f5f5f5; color: #111; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+.render-loading { display: grid; flex: 1; place-items: center; color: var(--muted); font-size: 13px; }
+.empty-state { padding: 22px 0; color: #333; }
+.empty-state h2 { margin: 0 0 5px; font-size: 16px; }
+.empty-state p { margin: 0; color: var(--muted); font-size: 12px; }
+.error-box { margin: 8px 0; padding: 8px 10px; border: 1px solid #c66; color: #722; background: #fff7f7; font-size: 13px; }
+.footer { padding: 10px 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+
+@media (max-width: 600px) {
+  .connection { max-width: 60%; font-size: 10px; }
+  .hero { padding-top: 14px; }
+  .paper-title { font-size: 15px; }
+  .paper-reader { padding-right: 8px; padding-left: 8px; }
+}

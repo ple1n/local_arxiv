@@ -1,0 +1,90 @@
+ArXiv dataset inspection and import outline
+============================================
+
+Dataset location
+----------------
+/4tb/dataset/arxiv-complete
+
+The dataset contains two Parquet groups:
+
+1. metadata: 1 shard, 3,148,796 rows, 1,643,927,530 bytes (about 1.64 GB)
+2. paper_text: 50 shards, 2,856,227 rows, 70,271,591,224 bytes (about 70.27 GB)
+
+Total: 51 shards, 6,005,023 input rows across the two groups (the groups overlap
+by paper_id), 71,915,518,754 bytes (about 71.92 GB) on disk. The paper_text
+shards contain 44,585 to 104,439 rows each and are about 1.30 to 1.63 GB
+apiece. Each group has one consistent Parquet schema across its inspected
+shards.
+
+Schemas
+-------
+
+metadata has 21 top-level fields:
+paper_id, title, authors, abstract, categories, primary_category, submitter,
+license, doi, journal_ref, comments, report_no, msc_class, acm_class, proxy,
+n_versions, first_version_date, latest_version_date, oai_datestamp, oai_sets,
+arxiv_abs_url.
+
+Most metadata fields are strings. n_versions is an integer; first_version_date
+and latest_version_date are millisecond timestamps. oai_sets is a list of
+strings.
+
+paper_text has 13 top-level fields:
+paper_id, text, main_file, resolution, n_tex_files, n_files_used,
+n_unused_files, text_encoding, text_sha256, title, abstract,
+primary_category, license.
+
+The paper text is stored as a string. n_tex_files, n_files_used, and
+n_unused_files are integers; the other fields are strings.
+
+Import outline
+--------------
+
+1. First sample (completed): 1,753 documents and 104,782,803 bytes of raw text
+   (about 99.91 MiB) were loaded from the first paper_text shard into
+   ./data/arxiv_lance/arxiv_full_text. A full-text index was created on
+   text and verified with a search for "documentclass". The directory measured
+   44,487,892 bytes (about 42.43 MiB) before adding metadata. This is the
+   observed compressed/indexed footprint for the text sample, not a guarantee
+   of the full dataset's storage ratio.
+2. Metadata pick: retain title, authors, abstract, categories, primary_category,
+   doi, journal_ref, and license as separate native columns in a
+   paper_id-linked metadata table. Add a B-tree index only on paper_id so query
+   results can retrieve these fields efficiently. Do not add indexes to every
+   metadata field until filtering workloads justify their extra storage.
+3. Confirm actual null rates, paper_id uniqueness, text size distribution, and
+   overlap with metadata before committing to a full load.
+4. Stream Parquet row groups/batches rather than materializing the ~72 GB
+   dataset in memory. Avoid loading `text` during metadata-only validation.
+5. Use paper_id as the candidate join key. Validate uniqueness and quantify
+   unmatched IDs in both directions; do not assume the row counts imply a
+   one-to-one match. Deduplicate or quarantine collisions according to the
+   desired data policy.
+6. For retrieval, keep full text in the indexed text table and metadata in a
+   paper_id-linked table with selected native metadata columns. This avoids
+   duplicating metadata in full-text storage while allowing the MCP server to
+   look up metadata for matching paper IDs.
+7. Define stable Arrow/Lance types explicitly, especially timestamps and the
+   list-valued oai_sets field. Decide how to represent missing text and
+   metadata, and keep text_sha256 for integrity/checking.
+8. Use LanceDB's Parquet ingestion path if it supports the needed schema and
+   join workflow. Otherwise, implement a bounded Rust streaming transform
+   using the existing Rust/Parquet dependencies and append prepared batches
+   to Lance. Verify the exact API and memory behavior with a bounded sample first.
+9. Make ingestion restartable by shard/row group: record completed inputs,
+   row counts, rejected rows, and output locations; compare source and
+   imported counts and sample records after each batch.
+10. Treat embeddings as a separate optional phase. The source files do not
+   include embeddings. If semantic search is wanted, choose an embedding model
+   and chunking policy for long papers, then add vectors incrementally; keep
+   raw text available independently of vector generation.
+
+The 100 MiB text sample and its matching metadata have been imported into local
+Lance tables. Full dataset row counts, key uniqueness, and join coverage have
+not yet been verified; those are sample/full-scan validation tasks, not
+established facts from Parquet headers.
+
+Inspection evidence
+-------------------
+row_headers.json contains the detailed Parquet row-header/schema metadata for
+all 51 shards. dataset_scan.log records the metadata-inspection run.
