@@ -18,7 +18,7 @@ use rmcp::{
     },
 };
 use serde::{Deserialize, Serialize};
-use std::{env, error::Error, net::SocketAddr, sync::Arc};
+use std::{env, error::Error, net::SocketAddr, sync::Arc, time::Instant};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::ServeDir,
@@ -53,6 +53,18 @@ struct SearchHit {
     metadata: Option<PaperMetadata>,
     snippet: String,
     snippet_truncated: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchResponse {
+    results: Vec<SearchHit>,
+    metadata: SearchMetadata,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchMetadata {
+    lookup_time_ms: u64,
+    result_count: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -110,6 +122,7 @@ impl ArxivMcpServer {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<String, McpError> {
+        let started_at = Instant::now();
         let query = args.query.trim();
         if query.is_empty() {
             return Err(McpError::invalid_params("query must not be empty", None));
@@ -156,7 +169,14 @@ impl ArxivMcpServer {
                 });
             }
         }
-        serde_json::to_string_pretty(&hits).map_err(internal_error)
+        let response = SearchResponse {
+            metadata: SearchMetadata {
+                lookup_time_ms: started_at.elapsed().as_millis() as u64,
+                result_count: hits.len(),
+            },
+            results: hits,
+        };
+        serde_json::to_string_pretty(&response).map_err(internal_error)
     }
 
     #[tool(description = "Retrieve the stored text of a paper by its arXiv paper_id.")]

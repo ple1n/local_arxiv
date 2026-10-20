@@ -52,7 +52,9 @@ and access-control layer before binding to a non-loopback interface.
 
 - `search_full_text(query, limit?)`: full-text search, returning paper IDs and
   short snippets plus available title/author/category/DOI metadata.
-  `limit` is capped at 10.
+  `limit` is capped at 10. The response includes `results` and `metadata`
+  (`lookup_time_ms` and `result_count`). Search does not currently support
+  pagination; `limit` only controls the maximum number of returned matches.
 - `get_paper_text(paper_id, max_chars?)`: return stored paper text, capped at
   12,000 characters per call by default and at most, along with available
   metadata.

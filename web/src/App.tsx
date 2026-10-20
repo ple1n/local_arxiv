@@ -22,6 +22,14 @@ type SearchHit = {
   snippet_truncated: boolean;
 };
 
+type SearchResponse = {
+  results: SearchHit[];
+  metadata: {
+    lookup_time_ms: number;
+    result_count: number;
+  };
+};
+
 type PaperText = {
   paper_id: string;
   metadata?: PaperMetadata | null;
@@ -322,25 +330,12 @@ function App() {
   const transportRef = useRef<StreamableHTTPClientTransport | null>(null);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
+  const [lookupTimeMs, setLookupTimeMs] = useState<number | null>(null);
   const [selected, setSelected] = useState<PaperText | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [status, setStatus] = useState("Connecting to :8000…");
   const [renderLatex, setRenderLatex] = useState(false);
-
-  useEffect(() => {
-    if (!selected) return;
-    const previousOverflow = document.body.style.overflow;
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setSelected(null);
-    };
-    document.body.style.overflow = "hidden";
-    window.addEventListener("keydown", onKeyDown);
-    return () => {
-      document.body.style.overflow = previousOverflow;
-      window.removeEventListener("keydown", onKeyDown);
-    };
-  }, [selected]);
 
   useEffect(() => {
     let active = true;
@@ -396,12 +391,15 @@ function App() {
         name: "search_full_text",
         arguments: { query: query.trim(), limit: 10 },
       });
-      setHits(
-        JSON.parse(getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean })) as SearchHit[],
-      );
+      const searchResponse = JSON.parse(
+        getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
+      ) as SearchResponse;
+      setHits(searchResponse.results);
+      setLookupTimeMs(searchResponse.metadata.lookup_time_ms);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
       setHits([]);
+      setLookupTimeMs(null);
     } finally {
       setBusy(false);
     }
@@ -470,6 +468,7 @@ function App() {
           <div className="results-heading">
             <div>
               <h2>{hits.length} matching papers</h2>
+              {lookupTimeMs !== null && <span>{lookupTimeMs} ms lookup</span>}
             </div>
             <span className="query-chip">{query}</span>
           </div>
@@ -518,13 +517,7 @@ function App() {
       </section>
       <footer className="footer">A local research tool · Search results are limited to the data currently indexed</footer>
       {selected && (
-        <div
-          className="reader-backdrop"
-          onClick={(event) => {
-            if (event.target === event.currentTarget) setSelected(null);
-          }}
-        >
-          <section className="paper-reader" role="dialog" aria-modal="true" aria-labelledby="reader-title">
+          <section className="paper-reader" aria-labelledby="reader-title">
             <div className="reader-header">
               <div>
                 <span className="eyebrow">{renderLatex ? "PAPER · " : "PAPER SOURCE · "}{selected.paper_id}</span>
@@ -554,7 +547,6 @@ function App() {
               </p>
             )}
           </section>
-        </div>
       )}
     </main>
   );
