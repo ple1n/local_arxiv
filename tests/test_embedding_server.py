@@ -25,6 +25,19 @@ class ProgressFieldTests(unittest.TestCase):
 
 
 class ProductQuantizationTests(unittest.TestCase):
+    def test_quantizer_iterations_update_job_progress(self):
+        job_id = "quantizer-progress-test"
+        embedding_server.index_jobs[job_id] = {"stage": "train_quantizer"}
+        report = embedding_server._make_quantizer_progress_tqdm(
+            job_id, 64, lambda iterable, **kwargs: iterable
+        )
+
+        self.assertEqual(list(report(range(50))), list(range(50)))
+        self.assertEqual(embedding_server.index_jobs[job_id]["stage"], "PQ codebook 1/64")
+        self.assertEqual(embedding_server.index_jobs[job_id]["completed"], 50)
+        self.assertEqual(embedding_server.index_jobs[job_id]["total"], 3200)
+        del embedding_server.index_jobs[job_id]
+
     def test_subvector_count_matches_lance_dimension_defaults(self):
         self.assertEqual(embedding_server._suggest_num_sub_vectors(1536), 96)
         self.assertEqual(embedding_server._suggest_num_sub_vectors(768), 48)

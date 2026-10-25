@@ -141,6 +141,50 @@ def _writable_lance_to_tensor(
     return ret
 
 
+def _make_quantizer_progress_tqdm(
+    job_id: str, num_sub_vectors: int, original_tqdm: Any
+) -> Any:
+    fit_count = 0
+    completed_iterations = 0
+
+    def tracked_tqdm(iterable: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal fit_count, completed_iterations
+        with index_jobs_lock:
+            in_quantizer = (
+                index_jobs.get(job_id, {}).get("stage") == "train_quantizer"
+            )
+        try:
+            iteration_count = len(iterable)
+        except TypeError:
+            iteration_count = 0
+        if not in_quantizer or iteration_count != 50:
+            return original_tqdm(iterable, *args, **kwargs)
+
+        fit_count += 1
+        fit_number = fit_count
+
+        def report_iterations() -> Any:
+            nonlocal completed_iterations
+            kwargs["disable"] = True
+            for iteration in original_tqdm(iterable, *args, **kwargs):
+                yield iteration
+                completed_iterations += 1
+                with index_jobs_lock:
+                    job = index_jobs.get(job_id)
+                    if job is not None:
+                        job.update(
+                            {
+                                "stage": f"PQ codebook {fit_number}/{num_sub_vectors}",
+                                "completed": completed_iterations,
+                                "total": num_sub_vectors * 50,
+                            }
+                        )
+
+        return report_iterations()
+
+    return tracked_tqdm
+
+
 class _ReadinessFlagSampler:
     def __call__(
         self,
@@ -308,6 +352,7 @@ def _run_index_job(
             column_name,
             ready_column if table.schema.get_field_index(ready_column) >= 0 else None,
         )
+        num_sub_vectors = _suggest_num_sub_vectors(dimension)
         num_partitions = _suggest_num_partitions(vector_count)
         dataset = table.to_lance()
         with index_jobs_lock:
@@ -316,17 +361,26 @@ def _run_index_job(
                 f"GPU IVF-PQ training on {vector_count} scoped vectors "
                 f"({num_partitions} partitions; filter: {scope_description})"
             )
+        from lance.torch import kmeans as lance_kmeans
+
+        original_tqdm = lance_kmeans.tqdm
+        lance_kmeans.tqdm = _make_quantizer_progress_tqdm(
+            job_id, num_sub_vectors, original_tqdm
+        )
         with gpu_lock:
-            dataset.create_index(
-                column=column_name,
-                index_type="IVF_PQ",
-                metric="cosine",
-                accelerator="cuda",
-                num_partitions=num_partitions,
-                num_sub_vectors=_suggest_num_sub_vectors(dimension),
-                replace=True,
-                progress_callback=update_progress,
-            )
+            try:
+                dataset.create_index(
+                    column=column_name,
+                    index_type="IVF_PQ",
+                    metric="cosine",
+                    accelerator="cuda",
+                    num_partitions=num_partitions,
+                    num_sub_vectors=num_sub_vectors,
+                    replace=True,
+                    progress_callback=update_progress,
+                )
+            finally:
+                lance_kmeans.tqdm = original_tqdm
         with index_jobs_lock:
             index_jobs[job_id].update(
                 {
