@@ -8,6 +8,7 @@ import ipaddress
 import json
 import math
 import os
+import random
 import re
 import traceback
 from concurrent.futures import ThreadPoolExecutor
@@ -31,6 +32,10 @@ index_jobs_lock = Lock()
 index_jobs: dict[str, dict[str, Any]] = {}
 index_executor = ThreadPoolExecutor(max_workers=1)
 JOB_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+_readiness_scope: tuple[str, str] | None = None
+_lance_readiness_scope_installed = False
+_readiness_row_counts: tuple[int, int] | None = None
+_original_lance_to_tensor: Any = None
 
 
 def _is_loopback_request(handler: BaseHTTPRequestHandler) -> bool:
@@ -82,6 +87,174 @@ def _suggest_num_partitions(vector_count: int) -> int:
     return min(max(1, vector_count // 8192), 4096)
 
 
+def _writable_fsl_to_tensor(arr: Any, dimension: int) -> Any:
+    import torch
+
+    values = arr.values.slice(arr.offset * dimension, len(arr) * dimension)
+    vectors = values.to_numpy(zero_copy_only=False).reshape(-1, dimension).copy()
+    return torch.from_numpy(vectors)
+
+
+def _writable_lance_to_tensor(
+    batch: Any,
+    *,
+    hf_converter: Any = None,
+    use_blob_api: bool = False,
+    **kwargs: Any,
+) -> Any:
+    import pyarrow as pa
+    import torch
+    from lance.torch import data as lance_torch_data
+
+    columns = batch.column_names if isinstance(batch, pa.RecordBatch) else list(batch)
+    ret = {}
+    for column in columns:
+        arr = batch[column]
+        if isinstance(arr.type, pa.FixedShapeTensorType):
+            arr = arr.storage
+        if pa.types.is_fixed_size_list(arr.type) and (
+            pa.types.is_floating(arr.type.value_type)
+            or pa.types.is_integer(arr.type.value_type)
+        ):
+            tensor = _writable_fsl_to_tensor(arr, arr.type.list_size)
+        elif (
+            pa.types.is_integer(arr.type)
+            or pa.types.is_floating(arr.type)
+            or pa.types.is_boolean(arr.type)
+        ):
+            tensor = torch.from_numpy(arr.to_numpy(zero_copy_only=False).copy())
+            if kwargs.get("uint64_as_int64", True) and tensor.dtype == torch.uint64:
+                tensor = tensor.to(torch.int64)
+        else:
+            if _original_lance_to_tensor is None:
+                raise TypeError(f"Unsupported Lance tensor type: {arr.type}")
+            return _original_lance_to_tensor(
+                batch,
+                hf_converter=hf_converter,
+                use_blob_api=use_blob_api,
+                **kwargs,
+            )
+        ret[column] = tensor
+
+    if len(ret) == 1:
+        return next(iter(ret.values()))
+    return ret
+
+
+class _ReadinessFlagSampler:
+    def __call__(
+        self,
+        dataset: Any,
+        *,
+        batch_size: int,
+        columns: Any,
+        filter: str,
+        batch_readahead: int,
+        with_row_id: bool,
+        **kwargs: Any,
+    ) -> Any:
+        yield from dataset.to_batches(
+            columns=columns,
+            filter=filter,
+            batch_size=batch_size,
+            batch_readahead=batch_readahead,
+            with_row_id=with_row_id,
+            use_scalar_index=True,
+        )
+
+
+def _install_lance_readiness_scope(
+    vector_column: str, ready_column: str | None
+) -> None:
+    global _lance_readiness_scope_installed, _original_lance_to_tensor, _readiness_scope
+    _readiness_scope = (
+        (vector_column, ready_column) if ready_column is not None else None
+    )
+    if _lance_readiness_scope_installed:
+        return
+
+    import lance.sampler as lance_sampler
+    from lance.torch import data as lance_torch_data
+    import lance.vector as lance_vector
+
+    original_dataset = lance_torch_data.LanceDataset
+    if _original_lance_to_tensor is None:
+        _original_lance_to_tensor = lance_torch_data._to_tensor
+    original_filtered_sample = lance_sampler._filtered_efficient_sample
+    original_tqdm = lance_vector.tqdm
+
+    class ReadinessScopedDataset(original_dataset):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            scope = _readiness_scope
+            kwargs.setdefault("to_tensor_fn", _writable_lance_to_tensor)
+            filter_value = kwargs.get("filter")
+            if (
+                scope is not None
+                and isinstance(filter_value, str)
+                and filter_value.casefold()
+                == f"{scope[0]} is not null".casefold()
+            ):
+                kwargs["filter"] = f"{scope[1]} = true"
+                if not kwargs.get("samples", 0):
+                    kwargs["sampler"] = _ReadinessFlagSampler()
+            super().__init__(*args, **kwargs)
+
+    def filtered_sample(
+        dataset: Any,
+        n: int,
+        columns: Any,
+        batch_size: int,
+        target_takes: int,
+        filter: str,
+    ) -> Any:
+        scope = _readiness_scope
+        if scope is None or filter.casefold() != f"{scope[1]} = true".casefold():
+            yield from original_filtered_sample(
+                dataset, n, columns, batch_size, target_takes, filter
+            )
+            return
+
+        if n <= 0:
+            return
+
+        available = dataset.count_rows(filter=filter)
+        sample_count = min(n, available)
+        if sample_count == 0:
+            return
+
+        window_count = min(64, sample_count)
+        for window in range(window_count):
+            window_size = sample_count // window_count + (
+                1 if window < sample_count % window_count else 0
+            )
+            stratum_start = window * available // window_count
+            stratum_end = (window + 1) * available // window_count
+            offset = random.randint(
+                stratum_start,
+                max(stratum_start, stratum_end - window_size),
+            )
+            yield from dataset.to_batches(
+                columns=columns,
+                filter=filter,
+                offset=offset,
+                limit=window_size,
+                batch_size=batch_size,
+                use_scalar_index=True,
+            )
+
+    def scoped_tqdm(*args: Any, **kwargs: Any) -> Any:
+        row_counts = _readiness_row_counts
+        if row_counts is not None and kwargs.get("total") == row_counts[0]:
+            kwargs["total"] = row_counts[1]
+        return original_tqdm(*args, **kwargs)
+
+    lance_torch_data.LanceDataset = ReadinessScopedDataset
+    lance_sampler._filtered_efficient_sample = filtered_sample
+    lance_vector.tqdm = scoped_tqdm
+    lance_torch_data._to_tensor = _writable_lance_to_tensor
+    _lance_readiness_scope_installed = True
+
+
 def _run_index_job(
     job_id: str,
     database_path: str,
@@ -103,10 +276,16 @@ def _run_index_job(
     try:
         import lancedb
         import torch
+        from lance.torch import data as lance_torch_data
 
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is unavailable; refusing to build the index on CPU")
 
+        global _original_lance_to_tensor
+        if _original_lance_to_tensor is None:
+            _original_lance_to_tensor = lance_torch_data._to_tensor
+        lance_torch_data._fsl_to_tensor = _writable_fsl_to_tensor
+        lance_torch_data._to_tensor = _writable_lance_to_tensor
         database = lancedb.connect(database_path)
         table = database.open_table(table_name)
         vector_type = table.schema.field(column_name).type
@@ -115,14 +294,27 @@ def _run_index_job(
             raise TypeError(
                 f"Vector column {column_name!r} must be a fixed-size list, got {vector_type}"
             )
-        vector_count = table.count_rows(filter=f"{column_name} IS NOT NULL")
+        ready_column = f"{column_name}_ready"
+        global _readiness_row_counts
+        if table.schema.get_field_index(ready_column) >= 0:
+            vector_count = table.count_rows(filter=f"{ready_column} = true")
+            _readiness_row_counts = (table.count_rows(), vector_count)
+            scope_description = ready_column
+        else:
+            vector_count = table.count_rows(filter=f"{column_name} IS NOT NULL")
+            _readiness_row_counts = None
+            scope_description = f"{column_name} IS NOT NULL"
+        _install_lance_readiness_scope(
+            column_name,
+            ready_column if table.schema.get_field_index(ready_column) >= 0 else None,
+        )
         num_partitions = _suggest_num_partitions(vector_count)
         dataset = table.to_lance()
         with index_jobs_lock:
             index_jobs[job_id]["state"] = "running"
             index_jobs[job_id]["stage"] = (
-                f"GPU IVF-PQ training ({vector_count} vectors, "
-                f"{num_partitions} partitions)"
+                f"GPU IVF-PQ training on {vector_count} scoped vectors "
+                f"({num_partitions} partitions; filter: {scope_description})"
             )
         with gpu_lock:
             dataset.create_index(

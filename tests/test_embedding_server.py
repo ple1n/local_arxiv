@@ -1,4 +1,5 @@
 import unittest
+import warnings
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -42,6 +43,28 @@ class ProductQuantizationTests(unittest.TestCase):
     def test_nonpositive_vector_count_is_rejected(self):
         with self.assertRaises(ValueError):
             embedding_server._suggest_num_partitions(0)
+
+    def test_fixed_size_list_conversion_uses_writable_numpy_memory(self):
+        import pyarrow as pa
+
+        vectors = pa.FixedSizeListArray.from_arrays(
+            pa.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), 3
+        )
+        batch = pa.record_batch(
+            [vectors, pa.array([10, 11], type=pa.uint64())],
+            names=["vector", "_rowid"],
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            tensors = embedding_server._writable_lance_to_tensor(batch)
+
+        self.assertEqual(
+            tensors["vector"].tolist(), [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]
+        )
+        self.assertEqual(tensors["_rowid"].tolist(), [10, 11])
+        self.assertFalse(
+            any("not writable" in str(warning.message).lower() for warning in caught)
+        )
 
 
 class IndexJobRequestTests(unittest.TestCase):
