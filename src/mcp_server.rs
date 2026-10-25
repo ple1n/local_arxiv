@@ -655,6 +655,13 @@ impl ArxivMcpServer {
         .map_err(internal_error)
     }
 
+    async fn open_fresh_metadata_table(&self) -> Result<Table, Box<dyn Error + Send + Sync>> {
+        let table_name =
+            env::var("ARXIV_METADATA_TABLE").unwrap_or_else(|_| "arxiv_metadata".to_owned());
+        let database = connect(&self.database_path).execute().await?;
+        Ok(database.open_table(&table_name).execute().await?)
+    }
+
     async fn build_gpu_vector_index(
         &self,
         table_name: &str,
@@ -1621,10 +1628,13 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        let status =
-            crate::hybrid_pipeline::abstract_vector_index_status(&self.metadata_table, model)
-                .await
-                .map_err(internal_error)?;
+        let metadata_table = self
+            .open_fresh_metadata_table()
+            .await
+            .map_err(internal_error)?;
+        let status = crate::hybrid_pipeline::abstract_vector_index_status(&metadata_table, model)
+            .await
+            .map_err(internal_error)?;
         serde_json::to_string(&status).map_err(internal_error)
     }
 
@@ -1645,10 +1655,13 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        let status =
-            crate::hybrid_pipeline::abstract_vector_index_status(&self.metadata_table, model)
-                .await
-                .map_err(internal_error)?;
+        let metadata_table = self
+            .open_fresh_metadata_table()
+            .await
+            .map_err(internal_error)?;
+        let status = crate::hybrid_pipeline::abstract_vector_index_status(&metadata_table, model)
+            .await
+            .map_err(internal_error)?;
         if !status.has_embeddings {
             return Err(McpError::invalid_params(
                 "no indexed abstract embeddings are available yet",
@@ -1669,8 +1682,12 @@ impl ArxivMcpServer {
         self.ensure_gpu_vector_index(&table_name, model)
             .await
             .map_err(internal_error)?;
+        let refreshed_metadata_table = self
+            .open_fresh_metadata_table()
+            .await
+            .map_err(internal_error)?;
         let final_status =
-            crate::hybrid_pipeline::abstract_vector_index_status(&self.metadata_table, model)
+            crate::hybrid_pipeline::abstract_vector_index_status(&refreshed_metadata_table, model)
                 .await
                 .map_err(internal_error)?;
         eprintln!(
@@ -2175,8 +2192,12 @@ impl ArxivMcpServer {
         let metadata_table_name =
             env::var("ARXIV_METADATA_TABLE").unwrap_or_else(|_| "arxiv_metadata".to_owned());
         if mode == "abstract" {
+            let metadata_table = self
+                .open_fresh_metadata_table()
+                .await
+                .map_err(internal_error)?;
             let status = crate::hybrid_pipeline::abstract_vector_index_status(
-                &self.metadata_table,
+                &metadata_table,
                 embedding_model,
             )
             .await
