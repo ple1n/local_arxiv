@@ -65,6 +65,16 @@ def _progress_fields(progress: Any) -> tuple[str, int | None, int | None]:
     return stage, None, None
 
 
+def _suggest_num_sub_vectors(dimension: int) -> int:
+    if dimension <= 0:
+        raise ValueError(f"Vector dimension must be positive, got {dimension}")
+    if dimension % 16 == 0:
+        return dimension // 16
+    if dimension % 8 == 0:
+        return dimension // 8
+    return 1
+
+
 def _run_index_job(
     job_id: str,
     database_path: str,
@@ -92,16 +102,23 @@ def _run_index_job(
 
         database = lancedb.connect(database_path)
         table = database.open_table(table_name)
+        vector_type = table.schema.field(column_name).type
+        dimension = getattr(vector_type, "list_size", None)
+        if not isinstance(dimension, int):
+            raise TypeError(
+                f"Vector column {column_name!r} must be a fixed-size list, got {vector_type}"
+            )
         dataset = table.to_lance()
         with index_jobs_lock:
             index_jobs[job_id]["state"] = "running"
-            index_jobs[job_id]["stage"] = "Opening Lance dataset"
+            index_jobs[job_id]["stage"] = "GPU IVF-PQ training and assignment"
         with gpu_lock:
             dataset.create_index(
                 column=column_name,
                 index_type="IVF_PQ",
                 metric="cosine",
                 accelerator="cuda",
+                num_sub_vectors=_suggest_num_sub_vectors(dimension),
                 replace=True,
                 progress_callback=update_progress,
             )

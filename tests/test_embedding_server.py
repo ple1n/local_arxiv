@@ -23,6 +23,17 @@ class ProgressFieldTests(unittest.TestCase):
         )
 
 
+class ProductQuantizationTests(unittest.TestCase):
+    def test_subvector_count_matches_lance_dimension_defaults(self):
+        self.assertEqual(embedding_server._suggest_num_sub_vectors(1536), 96)
+        self.assertEqual(embedding_server._suggest_num_sub_vectors(768), 48)
+        self.assertEqual(embedding_server._suggest_num_sub_vectors(33), 1)
+
+    def test_nonpositive_dimension_is_rejected(self):
+        with self.assertRaises(ValueError):
+            embedding_server._suggest_num_sub_vectors(0)
+
+
 class IndexJobRequestTests(unittest.TestCase):
     def setUp(self):
         embedding_server.index_jobs.clear()

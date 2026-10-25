@@ -229,7 +229,8 @@ uv run --extra indexer python embedding_server.py
 ```
 
 The worker requires CUDA and fails rather than silently building the index on
-the CPU. The optional `/embed` endpoint still uses Sentence Transformers; its
+the CPU. It derives the required PQ subvector count from the vector dimension.
+The optional `/embed` endpoint still uses Sentence Transformers; its
 `embedding` extra is needed only when that endpoint is used, and the model is
 loaded lazily so index-only runs do not reserve GPU memory for it. The Rust
 embedding and reranking pipeline remain unchanged. The chunk-test `ctx`
