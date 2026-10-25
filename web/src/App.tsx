@@ -106,6 +106,7 @@ type AbstractEmbeddingIndexStatus = {
   embedded_vectors: number;
   indexed_vectors: number;
   unindexed_vectors: number;
+  index_unindexed_rows: number;
   vector_index_ready: boolean;
 };
 
@@ -491,9 +492,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [tokenBudget, setTokenBudget] = useState(480);
 
   useEffect(() => {
-    if (selectedEmbeddingModel) {
-      void refreshAbstractEmbeddingIndexStatus(selectedEmbeddingModel);
-    }
+    if (!selectedEmbeddingModel) return;
+    void refreshAbstractEmbeddingIndexStatus(selectedEmbeddingModel);
   }, [selectedEmbeddingModel]);
 
   useEffect(() => {
@@ -673,6 +673,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       const indexStatus = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
       ) as AbstractEmbeddingIndexStatus;
+      if (indexStatus.embedding_model !== model) return;
       setAbstractEmbeddingIndexStatus(indexStatus);
       setAbstractIndexError("");
     } catch (reason) {
@@ -1156,13 +1157,15 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                     : "Embed"}
           </button>
           {abstractEmbeddingIndexStatus?.has_embeddings &&
-            !abstractEmbeddingIndexStatus.vector_index_ready && (
+            (!abstractEmbeddingIndexStatus.vector_index_ready ||
+              abstractEmbeddingIndexStatus.unindexed_vectors > 0 ||
+              abstractEmbeddingIndexStatus.index_unindexed_rows > 0) && (
               <button
                 className="chunk-button"
                 onClick={() => void buildAbstractVectorIndex()}
                 disabled={abstractIndexBusy || embeddingBusy}
               >
-                {abstractIndexBusy ? "Building index…" : "Index not ready"}
+                {abstractIndexBusy ? "Building index…" : "Update vector index"}
               </button>
             )}
           {semanticSearch && abstractIndexError && (

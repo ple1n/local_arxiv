@@ -743,14 +743,18 @@ impl ArxivMcpServer {
         if vector_count == 0 {
             return Err(format!("no embeddings found in vector column {column_name:?}").into());
         }
-        if table.list_indices().await?.iter().any(|index| {
+        let existing_index = table.list_indices().await?.into_iter().find(|index| {
             index.index_type.to_string().eq_ignore_ascii_case("IVF_PQ")
                 && index.columns.iter().any(|column| column == &column_name)
-                && index
-                    .num_indexed_rows
-                    .and_then(|count| usize::try_from(count).ok())
-                    .is_some_and(|count| count >= vector_count)
-        }) {
+        });
+        let index_is_current = if let Some(index) = existing_index {
+            table.index_stats(&index.name).await?.is_some_and(|stats| {
+                stats.num_indexed_rows >= vector_count && stats.num_unindexed_rows == 0
+            })
+        } else {
+            false
+        };
+        if index_is_current {
             return Ok(());
         }
 
@@ -771,14 +775,25 @@ impl ArxivMcpServer {
         let vector_count = refreshed_table
             .count_rows(Some(format!("{column_name} IS NOT NULL")))
             .await?;
-        if !refreshed_table.list_indices().await?.iter().any(|index| {
-            index.index_type.to_string().eq_ignore_ascii_case("IVF_PQ")
-                && index.columns.iter().any(|column| column == &column_name)
-                && index
-                    .num_indexed_rows
-                    .and_then(|count| usize::try_from(count).ok())
-                    .is_some_and(|count| count >= vector_count)
-        }) {
+        let rebuilt_index = refreshed_table
+            .list_indices()
+            .await?
+            .into_iter()
+            .find(|index| {
+                index.index_type.to_string().eq_ignore_ascii_case("IVF_PQ")
+                    && index.columns.iter().any(|column| column == &column_name)
+            });
+        let index_is_current = if let Some(index) = rebuilt_index {
+            refreshed_table
+                .index_stats(&index.name)
+                .await?
+                .is_some_and(|stats| {
+                    stats.num_indexed_rows >= vector_count && stats.num_unindexed_rows == 0
+                })
+        } else {
+            false
+        };
+        if !index_is_current {
             return Err(format!(
                 "Python indexer completed without covering all {vector_count} vectors in {column_name:?}"
             )

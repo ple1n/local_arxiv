@@ -1321,6 +1321,7 @@ pub struct AbstractVectorIndexStatus {
     pub embedded_vectors: usize,
     pub indexed_vectors: usize,
     pub unindexed_vectors: usize,
+    pub index_unindexed_rows: usize,
     pub vector_index_ready: bool,
 }
 
@@ -1352,13 +1353,24 @@ pub async fn abstract_vector_index_status(
     } else {
         0
     };
-    let indexed_vectors = vector_index
-        .and_then(|index| index.num_indexed_rows)
-        .and_then(|count| usize::try_from(count).ok())
+    let index_stats = if let Some(index) = vector_index {
+        table.index_stats(&index.name).await?
+    } else {
+        None
+    };
+    let indexed_vectors = index_stats
+        .as_ref()
+        .map(|stats| stats.num_indexed_rows)
+        .unwrap_or(0);
+    let index_unindexed_rows = index_stats
+        .as_ref()
+        .map(|stats| stats.num_unindexed_rows)
         .unwrap_or(0);
     let unindexed_vectors = embedded_vectors.saturating_sub(indexed_vectors);
-    let vector_index_ready =
-        embedded_vectors > 0 && vector_index.is_some() && indexed_vectors >= embedded_vectors;
+    let vector_index_ready = embedded_vectors > 0
+        && index_stats.is_some()
+        && indexed_vectors >= embedded_vectors
+        && index_unindexed_rows == 0;
     Ok(AbstractVectorIndexStatus {
         embedding_model: embedding_model.to_owned(),
         vector_column,
@@ -1369,6 +1381,7 @@ pub async fn abstract_vector_index_status(
         embedded_vectors,
         indexed_vectors,
         unindexed_vectors,
+        index_unindexed_rows,
         vector_index_ready,
     })
 }
@@ -2053,6 +2066,7 @@ mod tests {
         assert_eq!(after_upsert.embedded_vectors, 17);
         assert!(!after_upsert.vector_index_ready);
         assert_eq!(after_upsert.unindexed_vectors, 1);
+        assert!(after_upsert.index_unindexed_rows > 0);
         let vector_index = metadata
             .list_indices()
             .await?
