@@ -789,8 +789,8 @@ impl ArxivMcpServer {
         database: &lancedb::Connection,
         paper_id: &str,
         text: &str,
-        chunked: Option<bool>,
-        embedded: Option<bool>,
+        mut chunked: Option<bool>,
+        mut embedded: Option<bool>,
         indexed_model: Option<&str>,
         ctx: usize,
         token_budget: usize,
@@ -810,6 +810,47 @@ impl ArxivMcpServer {
             })
             .await;
         let same_model = indexed_model == Some(self.embedding_model.as_str());
+        if chunked == Some(true) && !(embedded == Some(true) && same_model) {
+            let safe_limit = crate::test_pipeline::effective_embedding_token_limit(
+                ctx,
+                self.embedding_max_tokens,
+            )?;
+            let stored_chunks = pipeline.paper_chunk_texts(paper_id).await?;
+            let mut must_rechunk = stored_chunks.is_empty();
+            for text in &stored_chunks {
+                let input = format!("document: {text}");
+                if self
+                    .embedding_tokenizer
+                    .encode(input, true)?
+                    .get_ids()
+                    .len()
+                    > safe_limit
+                {
+                    must_rechunk = true;
+                    break;
+                }
+            }
+            if must_rechunk {
+                pipeline.delete_paper_chunks(paper_id).await?;
+                update_paper_index_state(
+                    &self.table,
+                    paper_id,
+                    &[
+                        ("chunked", "false".to_owned()),
+                        ("embedded", "false".to_owned()),
+                        ("chunk_count", "0".to_owned()),
+                        ("embedded_chunk_count", "0".to_owned()),
+                        (
+                            "indexing_error",
+                            sql_string("Stored chunks exceeded the safe embedding limit; regenerating them with the configured tokenizer."),
+                        ),
+                    ],
+                )
+                .await?;
+                chunked = Some(false);
+                embedded = Some(false);
+            }
+        }
         if chunked != Some(true) {
             self.index_jobs
                 .update(|progress| progress.phase = Some("tokenizing and chunking".to_owned()))

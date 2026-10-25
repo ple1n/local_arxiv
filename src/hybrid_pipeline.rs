@@ -242,6 +242,57 @@ impl<'a> HybridPipeline<'a> {
         Ok(chunks.len())
     }
 
+    pub async fn paper_chunk_texts(&self, paper_id: &str) -> PipelineResult<Vec<String>> {
+        let names = self.connection.table_names().execute().await?;
+        if !names.iter().any(|name| name == &self.tables.chunks) {
+            return Ok(Vec::new());
+        }
+        let table = self
+            .connection
+            .open_table(&self.tables.chunks)
+            .execute()
+            .await?;
+        let escaped_id = paper_id.replace('\'', "''");
+        let mut rows = table
+            .query()
+            .only_if(format!("paper_id = '{escaped_id}'"))
+            .select(Select::columns(&["text"]))
+            .execute()
+            .await?;
+        let mut texts = Vec::new();
+        while let Some(batch) = rows.next().await {
+            let batch = batch?;
+            let values = batch
+                .column_by_name("text")
+                .ok_or("chunk table is missing text")?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or("chunk text must be UTF-8")?;
+            for row in 0..values.len() {
+                if values.is_null(row) {
+                    return Err("chunk text must not be null".into());
+                }
+                texts.push(values.value(row).to_owned());
+            }
+        }
+        Ok(texts)
+    }
+
+    pub async fn delete_paper_chunks(&self, paper_id: &str) -> PipelineResult<()> {
+        let names = self.connection.table_names().execute().await?;
+        if names.iter().any(|name| name == &self.tables.chunks) {
+            let table = self
+                .connection
+                .open_table(&self.tables.chunks)
+                .execute()
+                .await?;
+            let escaped_id = paper_id.replace('\'', "''");
+            let predicate = format!("paper_id = '{escaped_id}'");
+            table.delete(&predicate).await?;
+        }
+        Ok(())
+    }
+
     pub async fn embed_chunk_batch(
         &self,
         chunk_ids: &[String],
@@ -1003,6 +1054,16 @@ mod tests {
             .execute()
             .await?;
         assert_eq!(table.count_rows(None).await?, 1);
+        assert_eq!(
+            pipeline.paper_chunk_texts("test-paper").await?,
+            vec!["replacement passage."]
+        );
+        pipeline.delete_paper_chunks("test-paper").await?;
+        let table = database
+            .open_table("tmp_test_chunks_hybrid_pipeline")
+            .execute()
+            .await?;
+        assert_eq!(table.count_rows(None).await?, 0);
         Ok(())
     }
 }

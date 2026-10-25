@@ -170,6 +170,8 @@ and include the prompt and special tokens in their measured size. The safe
 limit is the smaller of the requested `ctx`, `models.embedding.maxTokens` (512
 by default), and the model's 768-token context, minus 32 tokens of headroom.
 Over-limit direct embedding inputs are rejected rather than silently truncated.
+Pending legacy chunks are checked before embedding; oversized chunks are removed
+and regenerated with the tokenizer-safe chunker.
 All embedding requests share a single scheduler permit, so a new request waits
 until the previous embedding request has completed. Embeddings are normalized
 in Rust. Qwen reranking remains on llama-server's `/rerank` endpoint.
