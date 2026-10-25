@@ -75,6 +75,9 @@ type IndexJobProgress = {
   job_id: string;
   state: "queued" | "running" | "paused" | "complete" | "complete_with_errors" | "failed";
   total_papers: number;
+  total_papers_known: boolean;
+  phase_completed: number;
+  phase_total: number | null;
   scanned_papers: number;
   elapsed_seconds: number;
   papers_per_second: number;
@@ -91,6 +94,13 @@ type StartIndexJobResponse = {
   job_id: string;
   events_url: string;
   state: string;
+};
+
+type IndexJobSubscription = {
+  job: StartIndexJobResponse;
+  paperId?: string;
+  mode: EmbeddingMode;
+  model: string;
 };
 
 type AvailableModel = {
@@ -422,6 +432,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const clientRef = useRef<Client | null>(null);
   const transportRef = useRef<StreamableHTTPClientTransport | null>(null);
   const jobEventSourceRef = useRef<EventSource | null>(null);
+  const indexJobSubscriptionRef = useRef<IndexJobSubscription | null>(null);
+  const lastIndexProgressAtRef = useRef(0);
   const [query, setQuery] = useState(initialParams.get("query") ?? "");
   const [searchUrl, setSearchUrl] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -441,6 +453,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [chunkError, setChunkError] = useState("");
   const [embeddingModel, setEmbeddingModel] = useState("");
   const [indexJobProgress, setIndexJobProgress] = useState<IndexJobProgress | null>(null);
+  const [indexJobMessage, setIndexJobMessage] = useState("");
   const [rerankQuery, setRerankQuery] = useState("");
   const [queryPipelineBusy, setQueryPipelineBusy] = useState(false);
   const [queryPipelineResult, setQueryPipelineResult] = useState<QueryPipelineResponse | null>(null);
@@ -450,6 +463,18 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [selectedRerankerModel, setSelectedRerankerModel] = useState("");
   const [embeddingMode, setEmbeddingMode] = useState<EmbeddingMode>("abstract");
   const [tokenBudget, setTokenBudget] = useState(480);
+
+  useEffect(() => {
+    if (!embeddingBusy) return;
+    const timer = window.setInterval(() => {
+      const events = jobEventSourceRef.current;
+      if (events && events.readyState !== EventSource.CLOSED &&
+        Date.now() - lastIndexProgressAtRef.current >= 15_000) {
+        setIndexJobMessage("No progress update received for 15 seconds. The backend may still be working; reconnect to check.");
+      }
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [embeddingBusy]);
 
   useEffect(() => {
     let active = true;
@@ -665,6 +690,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
     setEmbeddingBusy(true);
     setChunkError("");
     setIndexJobProgress(null);
+    indexJobSubscriptionRef.current = null;
+    setIndexJobMessage("Submitting indexing job…");
     try {
       const response = await client.callTool({
         name: "start_indexing_job",
@@ -675,22 +702,50 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       const job = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
       ) as StartIndexJobResponse;
+      connectIndexingProgress({ job, paperId, mode: embeddingMode, model: selectedEmbeddingModel });
+    } catch (reason) {
+      setEmbeddingBusy(false);
+      const message = reason instanceof Error ? reason.message : String(reason);
+      setChunkError(message);
+      setIndexJobMessage(`Could not start indexing: ${message}`);
+    }
+  }
+
+  function connectIndexingProgress(subscription: IndexJobSubscription) {
+      jobEventSourceRef.current?.close();
+      indexJobSubscriptionRef.current = subscription;
+      const { job, paperId, mode, model } = subscription;
+      setEmbeddingBusy(true);
+      setIndexJobMessage("Connecting to indexing progress…");
+      lastIndexProgressAtRef.current = Date.now();
       const events = new EventSource(new URL(job.events_url, apiBaseUrl));
       jobEventSourceRef.current = events;
       events.addEventListener("progress", (event) => {
-        const progress = JSON.parse((event as MessageEvent<string>).data) as IndexJobProgress;
+        let progress: IndexJobProgress;
+        try {
+          progress = JSON.parse((event as MessageEvent<string>).data) as IndexJobProgress;
+        } catch (reason) {
+          events.close();
+          jobEventSourceRef.current = null;
+          setEmbeddingBusy(false);
+          setIndexJobMessage(`Invalid indexing progress: ${reason instanceof Error ? reason.message : String(reason)}. The backend job may still be running.`);
+          return;
+        }
+        lastIndexProgressAtRef.current = Date.now();
+        setIndexJobMessage("");
         setIndexJobProgress(progress);
         if (progress.state === "complete" || progress.state === "complete_with_errors" || progress.state === "failed") {
           events.close();
           if (jobEventSourceRef.current === events) jobEventSourceRef.current = null;
+          indexJobSubscriptionRef.current = null;
           setEmbeddingBusy(false);
           if (
             paperId &&
-            embeddingMode === "full_text" &&
+            mode === "full_text" &&
             progress.embedded_papers > 0 &&
             progress.failed_papers === 0
           ) {
-            setEmbeddingModel(selectedEmbeddingModel);
+            setEmbeddingModel(model);
             setChunkResult((current) => current && ({
               ...current,
               chunks: current.chunks.map((chunk) => ({
@@ -708,16 +763,18 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
           }
         }
       });
+      events.onopen = () => {
+        lastIndexProgressAtRef.current = Date.now();
+        setIndexJobMessage("Connected; waiting for indexing progress…");
+      };
       events.onerror = () => {
         if (events.readyState === EventSource.CLOSED) {
           setEmbeddingBusy(false);
-          setChunkError("Lost the indexing progress stream. The backend job may still be running; reconnect to its events to check.");
+          setIndexJobMessage("Indexing progress disconnected. The backend job may still be running.");
+        } else {
+          setIndexJobMessage("Reconnecting to indexing progress… The backend job continues running.");
         }
       };
-    } catch (reason) {
-      setEmbeddingBusy(false);
-      setChunkError(reason instanceof Error ? reason.message : String(reason));
-    }
   }
 
   async function setIndexingPaused(paused: boolean) {
@@ -800,25 +857,62 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
         </a>
         <span className="connection"><i />{status}</span>
       </header>
-      {indexJobProgress && (
+      {(embeddingBusy || indexJobProgress || indexJobMessage) && (
         <div className="embedding-progress" aria-live="polite">
+          <div className="progress-heading">
+            <strong>{indexJobProgress?.phase ?? (embeddingBusy ? "Indexing papers" : "Index job")}</strong>
+            {indexJobProgress?.total_papers_known && (
+              <span>
+                {indexJobProgress.scanned_papers.toLocaleString()} /{" "}
+                {indexJobProgress.total_papers.toLocaleString()} papers
+              </span>
+            )}
+          </div>
           <progress
             aria-label="Backend indexing progress"
-            max={Math.max(indexJobProgress.total_papers, 1)}
-            value={indexJobProgress.scanned_papers}
+            max={Math.max(indexJobProgress?.phase_total ?? indexJobProgress?.total_papers ?? 1, 1)}
+            value={
+              indexJobProgress?.phase_total != null
+                ? indexJobProgress.phase_completed
+                : indexJobProgress?.total_papers_known
+                  ? (embeddingBusy && indexJobProgress.scanned_papers >= indexJobProgress.total_papers
+                    ? undefined
+                    : indexJobProgress.scanned_papers)
+                  : undefined
+            }
           />
+          {indexJobMessage && <span role="status">{indexJobMessage}</span>}
+          {indexJobMessage && indexJobSubscriptionRef.current && (
+            <button
+              className="chunk-button"
+              onClick={() => {
+                const subscription = indexJobSubscriptionRef.current;
+                if (subscription) connectIndexingProgress(subscription);
+              }}
+            >
+              Reconnect progress
+            </button>
+          )}
+          {indexJobProgress && <>
           <span>
-            Index job {indexJobProgress.state} · {indexJobProgress.scanned_papers.toLocaleString()} /{" "}
-            {indexJobProgress.total_papers.toLocaleString()} papers ·{" "}
+            Index job {indexJobProgress.state}
+            {indexJobProgress.phase && ` · ${indexJobProgress.phase}`}
+            {indexJobProgress.phase_total != null && (
+              <> · {indexJobProgress.phase_completed.toLocaleString()} / {indexJobProgress.phase_total.toLocaleString()} metadata rows prepared</>
+            )}
+            {indexJobProgress.total_papers_known && (
+              <> · {indexJobProgress.scanned_papers.toLocaleString()} / {indexJobProgress.total_papers.toLocaleString()} papers</>
+            )}
+            {" · "}
             {indexJobProgress.papers_per_second.toFixed(2)} papers/s · ETA{" "}
             {formatDuration(indexJobProgress.eta_seconds)} · elapsed{" "}
             {formatDuration(indexJobProgress.elapsed_seconds)} ·{" "}
             {indexJobProgress.chunked_papers.toLocaleString()} chunked ·{" "}
             {indexJobProgress.embedded_papers.toLocaleString()} embedded ·{" "}
             {indexJobProgress.failed_papers.toLocaleString()} failed
-            {indexJobProgress.phase && ` · ${indexJobProgress.phase}`}
             {indexJobProgress.current_paper && ` · current: ${indexJobProgress.current_paper}`}
           </span>
+          {indexJobProgress.error && <span role="alert">Latest error: {indexJobProgress.error}</span>}
           {(indexJobProgress.state === "running" || indexJobProgress.state === "paused") && (
             <button
               className="chunk-button"
@@ -832,7 +926,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                   : "Pause indexing"}
             </button>
           )}
-          <span>Pausing waits for the in-flight embedding request to finish.</span>
+          {embeddingBusy && <span>Pausing waits for the current preparation batch or embedding request to finish.</span>}
+          </>}
         </div>
       )}
 

@@ -81,6 +81,13 @@ The database path and table names remain backend environment settings:
   The backend owns the job and streams
   progress at `/indexing-jobs/{job_id}/events`, including papers per second,
   elapsed time, estimated time remaining, current paper, and processing phase.
+  The job ID is returned before database preparation or pending-work counting.
+  The UI immediately shows an indeterminate progress bar, reports abstract-table
+  preparation counts, then switches to paper progress while embedding. Vector
+  index creation remains an active phase until it finishes; a full paper count
+  does not mean the job has completed. Progress heartbeats arrive every second.
+  Connection loss, retries, and per-paper errors are shown in the progress panel,
+  with a **Reconnect progress** action that reattaches without starting a new job.
   The web UI can pause and resume a job; pausing waits for the in-flight
   embedding request to finish and blocks subsequent embedding requests.
   Single-paper jobs and full-corpus jobs use the same per-paper processing

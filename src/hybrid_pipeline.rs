@@ -930,37 +930,60 @@ pub async fn ensure_abstract_table(
     connection: &Connection,
     metadata_table: &Table,
 ) -> PipelineResult<Table> {
+    ensure_abstract_table_with_progress(connection, metadata_table, |_, _| async { Ok(()) }).await
+}
+
+pub async fn ensure_abstract_table_with_progress<F, Fut>(
+    connection: &Connection,
+    metadata_table: &Table,
+    mut progress: F,
+) -> PipelineResult<Table>
+where
+    F: FnMut(usize, usize) -> Fut,
+    Fut: std::future::Future<Output = PipelineResult<()>>,
+{
+    let total = metadata_table.count_rows(None).await?;
+    progress(0, total).await?;
     let names = connection.table_names().execute().await?;
     if names.iter().any(|name| name == GLOBAL_ABSTRACT_TABLE) {
         let existing = connection
             .open_table(GLOBAL_ABSTRACT_TABLE)
             .execute()
             .await?;
-        if existing.count_rows(None).await? == metadata_table.count_rows(None).await? {
+        if existing.count_rows(None).await? == total {
+            progress(total, total).await?;
             return Ok(existing);
         }
         let mut table = Some(existing);
-        copy_missing_abstracts(connection, metadata_table, &mut table).await?;
+        copy_missing_abstracts(connection, metadata_table, &mut table, total, &mut progress)
+            .await?;
         let table = table.expect("existing abstract table is present");
-        if table.count_rows(None).await? != metadata_table.count_rows(None).await? {
+        if table.count_rows(None).await? != total {
             return Err("abstract table row count does not match metadata table".into());
         }
         return Ok(table);
     }
     let mut table = None;
-    copy_missing_abstracts(connection, metadata_table, &mut table).await?;
+    copy_missing_abstracts(connection, metadata_table, &mut table, total, &mut progress).await?;
     let table = table.ok_or("metadata table contains no abstract rows")?;
-    if table.count_rows(None).await? != metadata_table.count_rows(None).await? {
+    if table.count_rows(None).await? != total {
         return Err("abstract table row count does not match metadata table".into());
     }
     Ok(table)
 }
 
-async fn copy_missing_abstracts(
+async fn copy_missing_abstracts<F, Fut>(
     connection: &Connection,
     metadata_table: &Table,
     table: &mut Option<Table>,
-) -> PipelineResult<()> {
+    total: usize,
+    progress: &mut F,
+) -> PipelineResult<()>
+where
+    F: FnMut(usize, usize) -> Fut,
+    Fut: std::future::Future<Output = PipelineResult<()>>,
+{
+    let mut completed = 0;
     let mut source = metadata_table
         .query()
         .select(Select::columns(&["paper_id", "abstract"]))
@@ -971,6 +994,7 @@ async fn copy_missing_abstracts(
         if batch.num_rows() == 0 {
             continue;
         }
+        let row_count = batch.num_rows();
         if table.is_none() {
             let schema = batch.schema();
             let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
@@ -983,6 +1007,8 @@ async fn copy_missing_abstracts(
                     .execute()
                     .await?,
             );
+            completed += row_count;
+            progress(completed, total).await?;
             continue;
         }
         let target = table.as_ref().expect("table is initialized");
@@ -1015,6 +1041,8 @@ async fn copy_missing_abstracts(
                 target_schema,
             )))
             .await?;
+        completed += row_count;
+        progress(completed, total).await?;
     }
     Ok(())
 }
@@ -1568,7 +1596,15 @@ mod tests {
             .create_table("metadata_test", metadata_batch)
             .execute()
             .await?;
-        let abstracts = ensure_abstract_table(&database, &metadata).await?;
+        let mut preparation_updates = Vec::new();
+        let abstracts =
+            super::ensure_abstract_table_with_progress(&database, &metadata, |completed, total| {
+                preparation_updates.push((completed, total));
+                async { Ok(()) }
+            })
+            .await?;
+        assert_eq!(preparation_updates.first(), Some(&(0, 2)));
+        assert_eq!(preparation_updates.last(), Some(&(2, 2)));
         let initial_schema = abstracts.schema().await?;
         assert_eq!(
             initial_schema

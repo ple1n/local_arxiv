@@ -63,6 +63,9 @@ struct IndexJobProgress {
     job_id: String,
     state: String,
     total_papers: usize,
+    total_papers_known: bool,
+    phase_completed: usize,
+    phase_total: Option<usize>,
     scanned_papers: usize,
     elapsed_seconds: f64,
     papers_per_second: f64,
@@ -118,6 +121,9 @@ impl IndexJobManager {
             job_id: job_id.clone(),
             state: "queued".to_owned(),
             total_papers,
+            total_papers_known: total_papers > 0,
+            phase_completed: 0,
+            phase_total: None,
             scanned_papers: 0,
             elapsed_seconds: 0.0,
             papers_per_second: 0.0,
@@ -145,7 +151,11 @@ impl IndexJobManager {
             } else {
                 0.0
             };
-            progress.eta_seconds = if progress.papers_per_second > 0.0 {
+            progress.eta_seconds = if progress.total_papers_known
+                && progress.scanned_papers < progress.total_papers
+                && progress.papers_per_second > 0.0
+                && progress.state == "running"
+            {
                 Some(
                     progress
                         .total_papers
@@ -161,10 +171,24 @@ impl IndexJobManager {
 
     async fn finish(&self, state: &str, error: Option<String>) {
         self.update(|progress| {
-            progress.state = state.to_owned();
+            progress.state = if state == "complete" && progress.failed_papers > 0 {
+                "complete_with_errors"
+            } else {
+                state
+            }
+            .to_owned();
             progress.current_paper = None;
-            progress.phase = None;
-            progress.error = error;
+            progress.phase = Some(
+                if state == "complete" && progress.total_papers == 0 {
+                    "No papers pending indexing"
+                } else {
+                    state
+                }
+                .to_owned(),
+            );
+            if error.is_some() || progress.failed_papers == 0 {
+                progress.error = error;
+            }
         })
         .await;
         self.paused.store(false, Ordering::Release);
@@ -242,8 +266,19 @@ impl Embedder for JobPausableEmbedder<'_> {
         Box::pin(async move {
             if let Some(jobs) = self.jobs {
                 jobs.wait_until_resumed().await;
+                jobs.update(|progress| {
+                    progress.phase = Some("Waiting for embedding service".to_owned());
+                })
+                .await;
             }
-            self.inner.embed(texts, task, ctx).await
+            let vectors = self.inner.embed(texts, task, ctx).await?;
+            if let Some(jobs) = self.jobs {
+                jobs.update(|progress| {
+                    progress.phase = Some("Persisting embedding vectors".to_owned());
+                })
+                .await;
+            }
+            Ok(vectors)
         })
     }
 }
@@ -597,6 +632,11 @@ impl ArxivMcpServer {
         token_budget: usize,
         mode: &str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        self.index_jobs
+            .update(|progress| {
+                progress.phase = Some("Connecting to database".to_owned());
+            })
+            .await;
         let database = connect(&self.database_path).execute().await?;
         if mode == "abstract" {
             return self.run_abstract_index_job(&database, paper_id).await;
@@ -606,6 +646,19 @@ impl ArxivMcpServer {
         } else {
             pending_index_filter(&self.embedding_model)
         };
+        self.index_jobs
+            .update(|progress| {
+                progress.phase = Some("Counting pending papers".to_owned());
+            })
+            .await;
+        let total = self.table.count_rows(Some(filter.clone())).await?;
+        self.index_jobs
+            .update(|progress| {
+                progress.total_papers = total;
+                progress.total_papers_known = true;
+                progress.phase = Some("Reading pending papers".to_owned());
+            })
+            .await;
         let mut rows = self
             .table
             .query()
@@ -677,6 +730,11 @@ impl ArxivMcpServer {
                     Ok((_, false)) => {}
                     Err(error) => {
                         failed_count += 1;
+                        self.index_jobs
+                            .update(|progress| {
+                                progress.error = Some(format!("{current_id}: {error}"));
+                            })
+                            .await;
                         update_paper_index_state(
                             &self.table,
                             &current_id,
@@ -719,6 +777,12 @@ impl ArxivMcpServer {
             })
             .await;
         if embedded_count > 0 {
+            self.index_jobs
+                .update(|progress| {
+                    progress.phase = Some("Building full-text vector index".to_owned());
+                    progress.current_paper = None;
+                })
+                .await;
             let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
                 &database,
                 crate::hybrid_pipeline::TableNames {
@@ -735,8 +799,34 @@ impl ArxivMcpServer {
         database: &lancedb::Connection,
         paper_id: Option<String>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        let table =
-            crate::hybrid_pipeline::ensure_abstract_table(database, &self.metadata_table).await?;
+        self.index_jobs
+            .update(|progress| {
+                progress.phase = Some("Preparing abstract table".to_owned());
+            })
+            .await;
+        let table = crate::hybrid_pipeline::ensure_abstract_table_with_progress(
+            database,
+            &self.metadata_table,
+            |completed, total| async move {
+                self.index_jobs.wait_until_resumed().await;
+                self.index_jobs
+                    .update(|progress| {
+                        progress.phase = Some("Preparing abstract table".to_owned());
+                        progress.phase_completed = completed;
+                        progress.phase_total = Some(total);
+                    })
+                    .await;
+                Ok(())
+            },
+        )
+        .await?;
+        self.index_jobs
+            .update(|progress| {
+                progress.phase = Some("Counting pending abstracts".to_owned());
+                progress.phase_completed = 0;
+                progress.phase_total = None;
+            })
+            .await;
         let vector_column = crate::hybrid_pipeline::vector_column_name(&self.embedding_model);
         let has_vector_column = table
             .schema()
@@ -750,6 +840,14 @@ impl ArxivMcpServer {
             filters.push(format!("{vector_column} IS NULL"));
         }
         let filter = (!filters.is_empty()).then(|| filters.join(" AND "));
+        let total = table.count_rows(filter.clone()).await?;
+        self.index_jobs
+            .update(|progress| {
+                progress.total_papers = total;
+                progress.total_papers_known = true;
+                progress.phase = Some("Reading pending abstracts".to_owned());
+            })
+            .await;
         let mut query = table.query();
         if let Some(filter) = filter {
             query = query.only_if(filter);
@@ -793,6 +891,11 @@ impl ArxivMcpServer {
                     Err(error) => {
                         failed_count += 1;
                         eprintln!("Abstract embedding failed for {id}: {error}");
+                        self.index_jobs
+                            .update(|progress| {
+                                progress.error = Some(format!("{id}: {error}"));
+                            })
+                            .await;
                     }
                 }
                 scanned += 1;
@@ -829,14 +932,14 @@ impl ArxivMcpServer {
             })
             .await;
         if embedded_count > 0 {
+            self.index_jobs
+                .update(|progress| {
+                    progress.phase = Some("Building abstract vector index".to_owned());
+                    progress.current_paper = None;
+                })
+                .await;
             crate::hybrid_pipeline::ensure_abstract_vector_index(database, &self.embedding_model)
                 .await?;
-        }
-        if failed_count > 0 {
-            return Err(format!(
-                "{failed_count} abstract embeddings failed; rerun to retry pending rows"
-            )
-            .into());
         }
         Ok(())
     }
@@ -1344,55 +1447,9 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        let database = connect(&self.database_path)
-            .execute()
-            .await
-            .map_err(internal_error)?;
-        let total_papers = if mode == "abstract" {
-            let abstracts =
-                crate::hybrid_pipeline::ensure_abstract_table(&database, &self.metadata_table)
-                    .await
-                    .map_err(internal_error)?;
-            let vector_column = crate::hybrid_pipeline::vector_column_name(&self.embedding_model);
-            let has_vector_column = abstracts
-                .schema()
-                .await
-                .map_err(internal_error)?
-                .field_with_name(&vector_column)
-                .is_ok();
-            let mut filters = Vec::new();
-            if let Some(id) = &paper_id {
-                filters.push(format!("paper_id = {}", sql_string(id)));
-            } else if has_vector_column {
-                filters.push(format!("{vector_column} IS NULL"));
-            }
-            abstracts
-                .count_rows((!filters.is_empty()).then(|| filters.join(" AND ")))
-                .await
-                .map_err(internal_error)?
-        } else if paper_id.is_some() {
-            self.table
-                .count_rows(Some(format!(
-                    "paper_id = {}",
-                    sql_string(paper_id.as_deref().unwrap_or_default())
-                )))
-                .await
-                .map_err(internal_error)?
-        } else {
-            self.table
-                .count_rows(Some(pending_index_filter(&self.embedding_model)))
-                .await
-                .map_err(internal_error)?
-        };
-        if total_papers == 0 {
-            return Err(McpError::invalid_params(
-                "There are no papers pending indexing",
-                None,
-            ));
-        }
         let job_id = self
             .index_jobs
-            .start(paper_id.clone(), total_papers)
+            .start(paper_id.clone(), 0)
             .await
             .map_err(|error| McpError::invalid_request(error, None))?;
         let server = self.clone();
@@ -2258,7 +2315,10 @@ async fn index_job_events(
                     }
                 }
             };
-            let finished = matches!(progress.state.as_str(), "complete" | "failed");
+            let finished = matches!(
+                progress.state.as_str(),
+                "complete" | "complete_with_errors" | "failed"
+            );
             let data = serde_json::to_string(&progress)
                 .expect("serializing indexing progress cannot fail");
             Some((
@@ -2325,6 +2385,85 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn indexing_progress_covers_preparation_embedding_and_finalization() {
+        let jobs = IndexJobManager::new();
+        let job_id = jobs.start(None, 0).await.unwrap();
+        let (queued, mut updates) = jobs.subscribe(&job_id).await.unwrap();
+        assert_eq!(queued.state, "queued");
+        assert!(!queued.total_papers_known);
+        assert_eq!(queued.phase_total, None);
+        assert!(jobs.start(None, 0).await.is_err());
+
+        jobs.update(|progress| {
+            progress.state = "running".to_owned();
+            progress.phase = Some("Preparing abstract table".to_owned());
+            progress.phase_completed = 2;
+            progress.phase_total = Some(10);
+        })
+        .await;
+        let preparing = updates.recv().await.unwrap();
+        assert_eq!(preparing.phase_completed, 2);
+        assert_eq!(preparing.phase_total, Some(10));
+        assert_eq!(preparing.scanned_papers, 0);
+
+        jobs.update(|progress| {
+            progress.total_papers = 3;
+            progress.total_papers_known = true;
+            progress.phase_total = None;
+            progress.phase_completed = 0;
+            progress.scanned_papers = 3;
+            progress.embedded_papers = 3;
+            progress.phase = Some("Building abstract vector index".to_owned());
+        })
+        .await;
+        let finalizing = updates.recv().await.unwrap();
+        assert_eq!(finalizing.state, "running");
+        assert_eq!(finalizing.scanned_papers, finalizing.total_papers);
+        assert_eq!(finalizing.phase_total, None);
+        assert_eq!(finalizing.eta_seconds, None);
+
+        jobs.finish("complete", None).await;
+        let complete = updates.recv().await.unwrap();
+        assert_eq!(complete.state, "complete");
+        let (reconnected, _) = jobs.subscribe(&job_id).await.unwrap();
+        assert_eq!(reconnected.state, "complete");
+        assert!(jobs.start(None, 0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn indexing_progress_preserves_errors_and_finishes_empty_jobs() {
+        let jobs = IndexJobManager::new();
+        let job_id = jobs.start(None, 0).await.unwrap();
+        jobs.update(|progress| {
+            progress.total_papers_known = true;
+        })
+        .await;
+        jobs.finish("complete", None).await;
+        let (empty, _) = jobs.subscribe(&job_id).await.unwrap();
+        assert_eq!(empty.state, "complete");
+        assert_eq!(empty.phase.as_deref(), Some("No papers pending indexing"));
+
+        let job_id = jobs.start(None, 2).await.unwrap();
+        jobs.update(|progress| {
+            progress.failed_papers = 1;
+            progress.error = Some("paper-1: embedding failed".to_owned());
+        })
+        .await;
+        jobs.finish("complete", None).await;
+        let (partial, _) = jobs.subscribe(&job_id).await.unwrap();
+        assert_eq!(partial.state, "complete_with_errors");
+        assert_eq!(partial.error.as_deref(), Some("paper-1: embedding failed"));
+
+        let job_id = jobs.start(None, 0).await.unwrap();
+        jobs.finish("failed", Some("preparation failed".to_owned()))
+            .await;
+        let (failed, _) = jobs.subscribe(&job_id).await.unwrap();
+        assert_eq!(failed.state, "failed");
+        assert_eq!(failed.error.as_deref(), Some("preparation failed"));
+        assert!(!jobs.active.load(std::sync::atomic::Ordering::Acquire));
     }
 
     #[tokio::test]
