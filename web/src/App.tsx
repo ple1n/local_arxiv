@@ -96,6 +96,19 @@ type StartIndexJobResponse = {
   state: string;
 };
 
+type AbstractEmbeddingIndexStatus = {
+  embedding_model: string;
+  vector_column: string;
+  vector_column_exists: boolean;
+  readiness_column: string;
+  readiness_index_ready: boolean;
+  has_embeddings: boolean;
+  embedded_vectors: number;
+  indexed_vectors: number;
+  unindexed_vectors: number;
+  vector_index_ready: boolean;
+};
+
 type IndexJobSubscription = {
   job: StartIndexJobResponse;
   paperId?: string;
@@ -436,6 +449,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const lastIndexProgressAtRef = useRef(0);
   const lastIndexProgressRenderAtRef = useRef(0);
   const [query, setQuery] = useState(initialParams.get("query") ?? "");
+  const [embeddedOnly, setEmbeddedOnly] = useState(initialParams.get("embedded_only") === "1");
   const [searchUrl, setSearchUrl] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [lookupTimeMs, setLookupTimeMs] = useState<number | null>(null);
@@ -461,9 +475,19 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [modelChoices, setModelChoices] = useState<ModelChoices>({ embedding: [], reranking: [] });
   const [modelChoicesError, setModelChoicesError] = useState("");
   const [selectedEmbeddingModel, setSelectedEmbeddingModel] = useState("");
+  const [abstractEmbeddingIndexStatus, setAbstractEmbeddingIndexStatus] =
+    useState<AbstractEmbeddingIndexStatus | null>(null);
+  const [abstractIndexBusy, setAbstractIndexBusy] = useState(false);
+  const [abstractIndexError, setAbstractIndexError] = useState("");
   const [selectedRerankerModel, setSelectedRerankerModel] = useState("");
   const [embeddingMode, setEmbeddingMode] = useState<EmbeddingMode>("abstract");
   const [tokenBudget, setTokenBudget] = useState(480);
+
+  useEffect(() => {
+    if (selectedEmbeddingModel) {
+      void refreshAbstractEmbeddingIndexStatus(selectedEmbeddingModel);
+    }
+  }, [selectedEmbeddingModel]);
 
   useEffect(() => {
     if (!embeddingBusy) return;
@@ -543,7 +567,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             );
           }
           const tool = initialParams.get("tool");
-          if (tool === "search_full_text" && initialParams.get("query")) {
+          if ((tool === "search_full_text" && initialParams.get("query")) ||
+            (tool === "search_embedded_papers" && initialParams.get("embedded_only") === "1")) {
             await fetchSearchPage(
               Number.parseInt(initialParams.get("offset") ?? "0", 10) || 0,
               false,
@@ -580,16 +605,24 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
 
   async function fetchSearchPage(offset: number, append: boolean, limit = 10, updateUrl = true) {
     const client = clientRef.current;
-    if (!client || !query.trim()) return;
+    const searchQuery = query.trim();
+    if (!client || (!searchQuery && !embeddedOnly)) return;
 
     setBusy(true);
     setError("");
     setSelected(null);
     try {
       const response = await client.callTool({
-        name: "search_full_text",
-        arguments: { query: query.trim(), limit, offset },
-      });
+        name: embeddedOnly ? "search_embedded_papers" : "search_full_text",
+        arguments: embeddedOnly
+          ? {
+              query: searchQuery,
+              ...(selectedEmbeddingModel ? { embedding_model: selectedEmbeddingModel } : {}),
+              limit,
+              offset,
+            }
+          : { query: searchQuery, limit, offset },
+      }, undefined, { timeout: 180_000 });
       const searchResponse = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
       ) as SearchResponse;
@@ -611,6 +644,51 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       }
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function refreshAbstractEmbeddingIndexStatus(model = selectedEmbeddingModel) {
+    const client = clientRef.current;
+    if (!client || !model) return;
+    try {
+      const response = await client.callTool({
+        name: "abstract_embedding_index_status",
+        arguments: { embedding_model: model },
+      });
+      const indexStatus = JSON.parse(
+        getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
+      ) as AbstractEmbeddingIndexStatus;
+      setAbstractEmbeddingIndexStatus(indexStatus);
+      setAbstractIndexError("");
+    } catch (reason) {
+      setAbstractEmbeddingIndexStatus(null);
+      setAbstractIndexError(
+        reason instanceof Error ? reason.message : String(reason),
+      );
+    }
+  }
+
+  async function buildAbstractVectorIndex() {
+    const client = clientRef.current;
+    if (!client || !selectedEmbeddingModel || abstractIndexBusy || embeddingBusy) return;
+    setAbstractIndexBusy(true);
+    setAbstractIndexError("");
+    try {
+      const response = await client.callTool({
+        name: "build_abstract_vector_index",
+        arguments: { embedding_model: selectedEmbeddingModel },
+      }, undefined, { timeout: 3_600_000 });
+      const builtStatus = JSON.parse(
+        getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
+      ) as AbstractEmbeddingIndexStatus;
+      setAbstractEmbeddingIndexStatus(builtStatus);
+    } catch (reason) {
+      setAbstractIndexError(
+        reason instanceof Error ? reason.message : String(reason),
+      );
+      await refreshAbstractEmbeddingIndexStatus();
+    } finally {
+      setAbstractIndexBusy(false);
     }
   }
 
@@ -776,6 +854,9 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
           if (jobEventSourceRef.current === events) jobEventSourceRef.current = null;
           indexJobSubscriptionRef.current = null;
           setEmbeddingBusy(false);
+          if (mode === "abstract") {
+            void refreshAbstractEmbeddingIndexStatus(model);
+          }
           if (
             paperId &&
             mode === "full_text" &&
@@ -989,13 +1070,21 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
-          <button type="submit" disabled={busy || !query.trim()}>
+          <button type="submit" disabled={busy || (!query.trim() && !embeddedOnly)}>
             {busy ? "Searching…" : "Search"}
             <span aria-hidden="true">↗</span>
           </button>
         </form>
         <div className="search-note">
           <span>Local index · Search results include matching text and metadata</span>
+          <label className="render-toggle">
+            <input
+              type="checkbox"
+              checked={embeddedOnly}
+              onChange={(event) => setEmbeddedOnly(event.target.checked)}
+            />
+            Embedded only
+          </label>
           <label className="model-select-label">
             Embedding mode
             <select
@@ -1033,9 +1122,23 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                 : indexJobProgress?.state === "running"
                   ? "Pause"
                   : embeddingBusy
-                    ? "Indexing…"
-                    : "index"}
+                    ? "Embedding…"
+                    : "Embed"}
           </button>
+          {embeddedOnly &&
+            abstractEmbeddingIndexStatus?.has_embeddings &&
+            !abstractEmbeddingIndexStatus.vector_index_ready && (
+              <button
+                className="chunk-button"
+                onClick={() => void buildAbstractVectorIndex()}
+                disabled={abstractIndexBusy || embeddingBusy}
+              >
+                {abstractIndexBusy ? "Building index…" : "Index not ready"}
+              </button>
+            )}
+          {embeddedOnly && abstractIndexError && (
+            <span role="alert">{abstractIndexError}</span>
+          )}
         </div>
       </section>
 
@@ -1197,7 +1300,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                       chunkResult.chunks.every((chunk) => chunk.embeddingStatus === "done")))
                 }
               >
-                {embeddingBusy ? "Indexing…" : "index"}
+                {embeddingBusy ? "Embedding…" : "Embed"}
               </button>
               {chunkView && (
                 <button className="chunk-button secondary" onClick={() => setChunkView(false)}>

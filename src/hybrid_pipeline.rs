@@ -8,21 +8,26 @@ use lancedb::{
     arrow::{
         SendableRecordBatchStream,
         arrow_array::{
-            Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator,
-            RecordBatchReader, StringArray, UInt32Array, UInt64Array, new_null_array,
+            Array, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch,
+            RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array, UInt64Array,
+            new_null_array,
         },
         arrow_schema::{DataType, Field, Schema},
     },
     index::{
         Index,
-        scalar::{BTreeIndexBuilder, FtsIndexBuilder, FullTextSearchQuery},
+        scalar::{BTreeIndexBuilder, BitmapIndexBuilder, FtsIndexBuilder, FullTextSearchQuery},
         vector::IvfFlatIndexBuilder,
     },
     query::{ExecutableQuery, QueryBase, Select},
     table::NewColumnTransform,
 };
 use serde::Serialize;
-use std::{collections::HashMap, error::Error, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    sync::Arc,
+};
 
 pub type PipelineResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 pub const GLOBAL_CHUNK_TABLE: &str = "arxiv_chunks";
@@ -445,6 +450,16 @@ impl<'a> HybridPipeline<'a> {
             )
             .into());
         }
+        let indices = table.list_indices().await?;
+        if indices
+            .iter()
+            .any(|index| index.columns.iter().any(|column| column == &column_name))
+        {
+            return Ok(());
+        }
+        eprintln!(
+            "[hybrid-search] no vector index for {column_name}; checking vectors before first-time index build"
+        );
         let mut stream = table
             .query()
             .only_if(format!("{column_name} IS NOT NULL"))
@@ -461,13 +476,8 @@ impl<'a> HybridPipeline<'a> {
         if !has_vectors {
             return Err(format!("no embeddings found in vector column {column_name:?}").into());
         }
-        let indices = table.list_indices().await?;
-        if indices
-            .iter()
-            .any(|index| index.columns.iter().any(|column| column == &column_name))
-        {
-            return Ok(());
-        }
+        let index_started = std::time::Instant::now();
+        eprintln!("[hybrid-search] vector index creation started column={column_name}");
         table
             .create_index(
                 &[column_name.as_str()],
@@ -475,6 +485,10 @@ impl<'a> HybridPipeline<'a> {
             )
             .execute()
             .await?;
+        eprintln!(
+            "[hybrid-search] vector index creation complete elapsed_ms={}",
+            index_started.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -784,6 +798,11 @@ impl<'a> HybridPipeline<'a> {
         ctx: usize,
         embedder: &dyn Embedder,
     ) -> PipelineResult<HybridResponse> {
+        let search_started = std::time::Instant::now();
+        eprintln!(
+            "[hybrid-search] start model={embedding_model:?} query_chars={} candidate_limit={candidate_limit}",
+            query.chars().count()
+        );
         if query.trim().is_empty() {
             return Err("hybrid search query must not be empty".into());
         }
@@ -804,6 +823,33 @@ impl<'a> HybridPipeline<'a> {
             .execute()
             .await?;
         let vector_column = vector_column_name(embedding_model);
+        let ready_column = embedding_ready_column_name(embedding_model);
+        let index_started = std::time::Instant::now();
+        eprintln!("[hybrid-search] checking vector-index coverage");
+        let index_status = abstract_vector_index_status(&abstract_table, embedding_model).await?;
+        if !index_status.vector_index_ready {
+            eprintln!(
+                "[hybrid-search] stopped: vector index not ready embedded={} indexed={} unindexed={}",
+                index_status.embedded_vectors,
+                index_status.indexed_vectors,
+                index_status.unindexed_vectors
+            );
+            return Err(format!(
+                "abstract vector index is not ready: {} embedded vectors, {} indexed, {} unindexed",
+                index_status.embedded_vectors,
+                index_status.indexed_vectors,
+                index_status.unindexed_vectors
+            )
+            .into());
+        }
+        eprintln!(
+            "[hybrid-search] vector index coverage ready elapsed_ms={} embedded={} indexed={}",
+            index_started.elapsed().as_millis(),
+            index_status.embedded_vectors,
+            index_status.indexed_vectors
+        );
+        let embed_started = std::time::Instant::now();
+        eprintln!("[hybrid-search] query embedding started");
         let query_vectors = embedder
             .embed(&[query.to_owned()], EmbeddingTask::Query, ctx)
             .await?;
@@ -813,6 +859,11 @@ impl<'a> HybridPipeline<'a> {
         if query_vector.is_empty() || query_vector.iter().any(|value| !value.is_finite()) {
             return Err("embedding service returned an empty or non-finite query vector".into());
         }
+        eprintln!(
+            "[hybrid-search] query embedding complete elapsed_ms={} dimensions={}",
+            embed_started.elapsed().as_millis(),
+            query_vector.len()
+        );
         let schema = abstract_table.schema().await?;
         match schema.field_with_name(&vector_column)?.data_type() {
             DataType::FixedSizeList(item, size)
@@ -825,8 +876,8 @@ impl<'a> HybridPipeline<'a> {
                 .into());
             }
         }
-        ensure_vector_index_for_table(&abstract_table, embedding_model).await?;
-
+        let lexical_started = std::time::Instant::now();
+        eprintln!("[hybrid-search] lexical retrieval started");
         let mut lexical_rows = full_text_table
             .query()
             .full_text_search(FullTextSearchQuery::new(query.to_owned()))
@@ -848,6 +899,42 @@ impl<'a> HybridPipeline<'a> {
                 });
             }
         }
+        let lexical_candidates = lexical.len();
+        eprintln!(
+            "[hybrid-search] lexical retrieval complete elapsed_ms={} candidates={lexical_candidates}",
+            lexical_started.elapsed().as_millis()
+        );
+        let filter_started = std::time::Instant::now();
+        if !lexical.is_empty() {
+            let ids = lexical
+                .iter()
+                .map(|hit| format!("'{}'", hit.paper_id.replace('\'', "''")))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut embedded_ids = abstract_table
+                .query()
+                .only_if(format!("paper_id IN ({ids}) AND {ready_column} = true"))
+                .select(Select::columns(&["paper_id"]))
+                .limit(candidate_limit)
+                .execute()
+                .await?;
+            let mut embedded = HashSet::new();
+            while let Some(batch) = embedded_ids.next().await {
+                let batch = batch?;
+                let paper_ids = batch.column_by_name("paper_id").ok_or("missing paper_id")?;
+                for row in 0..batch.num_rows() {
+                    embedded.insert(utf8_at(paper_ids.as_ref(), row)?.to_owned());
+                }
+            }
+            lexical.retain(|hit| embedded.contains(&hit.paper_id));
+        }
+        eprintln!(
+            "[hybrid-search] embedded-subset filter complete elapsed_ms={} candidates={}",
+            filter_started.elapsed().as_millis(),
+            lexical.len()
+        );
+        let dense_started = std::time::Instant::now();
+        eprintln!("[hybrid-search] dense retrieval started");
         let dense = collect_abstract_ranked(
             abstract_table
                 .vector_search(query_vector.clone())?
@@ -860,9 +947,25 @@ impl<'a> HybridPipeline<'a> {
         )
         .await?;
         let mut dense = dense;
+        let dense_count = dense.len();
+        let abstract_started = std::time::Instant::now();
+        let paper_ids = dense
+            .iter()
+            .map(|hit| hit.paper_id.as_str())
+            .collect::<Vec<_>>();
+        let abstracts = metadata_abstracts(&abstract_table, &paper_ids).await?;
         for hit in &mut dense {
-            hit.abstract_text = metadata_abstract(&abstract_table, &hit.paper_id).await?;
+            hit.abstract_text = abstracts
+                .get(&hit.paper_id)
+                .cloned()
+                .ok_or_else(|| format!("metadata missing for {}", hit.paper_id))?;
         }
+        eprintln!(
+            "[hybrid-search] dense retrieval complete elapsed_ms={} dense_candidates={dense_count} abstract_rows={} abstract_fetch_ms={}",
+            dense_started.elapsed().as_millis(),
+            abstracts.len(),
+            abstract_started.elapsed().as_millis()
+        );
 
         let mut fused: HashMap<String, RankedHit> = HashMap::new();
         let mut lexical_rank = 0;
@@ -900,6 +1003,13 @@ impl<'a> HybridPipeline<'a> {
                 .then(left.paper_id.cmp(&right.paper_id))
         });
         hits.truncate(candidate_limit);
+        eprintln!(
+            "[hybrid-search] fusion complete lexical_candidates={} dense_candidates={} fused_results={} elapsed_ms={}",
+            lexical_rank,
+            dense_count,
+            hits.len(),
+            search_started.elapsed().as_millis()
+        );
         let reranker_model = if let Some(reranker) = reranker {
             let docs: Vec<String> = hits.iter().map(|hit| hit.text.clone()).collect();
             let scores = reranker.rerank(query, &docs).await?;
@@ -953,8 +1063,10 @@ pub async fn embed_abstract_batch(
         return Err("cannot embed an empty abstract".into());
     }
     let column = vector_column_name(embedding_model);
+    let ready_column = embedding_ready_column_name(embedding_model);
     let has_column = table.schema().await?.field_with_name(&column).is_ok();
-    if has_column {
+    let has_ready_column = table.schema().await?.field_with_name(&ready_column).is_ok();
+    if has_column && has_ready_column {
         let ids = papers
             .iter()
             .map(|(id, _)| format!("'{}'", id.replace('\'', "''")))
@@ -962,7 +1074,9 @@ pub async fn embed_abstract_batch(
             .join(", ");
         let mut existing = table
             .query()
-            .only_if(format!("paper_id IN ({ids}) AND {column} IS NULL"))
+            .only_if(format!(
+                "paper_id IN ({ids}) AND ({ready_column} IS NULL OR {ready_column} = false)"
+            ))
             .select(Select::columns(&["paper_id"]))
             .execute()
             .await?;
@@ -997,6 +1111,7 @@ async fn write_abstract_batch(
     embedder: &dyn Embedder,
 ) -> PipelineResult<usize> {
     let column = vector_column_name(embedding_model);
+    let ready_column = embedding_ready_column_name(embedding_model);
     let texts: Vec<String> = papers.iter().map(|(_, text)| text.clone()).collect();
     let vectors = embedder.embed(&texts, EmbeddingTask::Document, ctx).await?;
     let dimensions = vectors.first().map(Vec::len).unwrap_or(0);
@@ -1017,6 +1132,21 @@ async fn write_abstract_batch(
             .add_columns()
             .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
                 Field::new(&column, data_type, true),
+                Field::new(&ready_column, DataType::Boolean, true),
+            ]))))
+            .execute()
+            .await?;
+    }
+    if table
+        .schema()
+        .await?
+        .field_with_name(&ready_column)
+        .is_err()
+    {
+        table
+            .add_columns()
+            .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
+                Field::new(&ready_column, DataType::Boolean, true),
             ]))))
             .execute()
             .await?;
@@ -1031,6 +1161,7 @@ async fn write_abstract_batch(
             ),
             true,
         ),
+        Field::new(&ready_column, DataType::Boolean, true),
     ]));
     let vector_values: Vec<f32> = vectors.into_iter().flatten().collect();
     let vector_array = Arc::new(FixedSizeListArray::try_new(
@@ -1046,6 +1177,7 @@ async fn write_abstract_batch(
                 papers.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
             )),
             vector_array,
+            Arc::new(BooleanArray::from(vec![true; papers.len()])),
         ],
     )?;
     let mut merge = table.merge_insert(&["paper_id"]);
@@ -1056,6 +1188,7 @@ async fn write_abstract_batch(
             schema,
         )))
         .await?;
+    ensure_embedding_ready_index(table, embedding_model).await?;
     Ok(papers.len())
 }
 
@@ -1066,26 +1199,135 @@ pub async fn ensure_abstract_vector_index(
     ensure_vector_index_for_table(table, embedding_model).await
 }
 
-async fn metadata_abstract(table: &Table, paper_id: &str) -> PipelineResult<String> {
-    let escaped_id = paper_id.replace('\'', "''");
-    let mut rows = table
-        .query()
-        .only_if(format!("paper_id = '{escaped_id}'"))
-        .select(Select::columns(&["abstract"]))
-        .limit(1)
+pub fn embedding_ready_column_name(model: &str) -> String {
+    let vector_column = vector_column_name(model);
+    format!("{}_ready", vector_column)
+}
+
+#[derive(Debug, Serialize)]
+pub struct AbstractVectorIndexStatus {
+    pub embedding_model: String,
+    pub vector_column: String,
+    pub vector_column_exists: bool,
+    pub readiness_column: String,
+    pub readiness_index_ready: bool,
+    pub has_embeddings: bool,
+    pub embedded_vectors: usize,
+    pub indexed_vectors: usize,
+    pub unindexed_vectors: usize,
+    pub vector_index_ready: bool,
+}
+
+pub async fn abstract_vector_index_status(
+    table: &Table,
+    embedding_model: &str,
+) -> PipelineResult<AbstractVectorIndexStatus> {
+    let vector_column = vector_column_name(embedding_model);
+    let readiness_column = embedding_ready_column_name(embedding_model);
+    let schema = table.schema().await?;
+    let vector_column_exists = schema.field_with_name(&vector_column).is_ok();
+    let readiness_column_exists = schema.field_with_name(&readiness_column).is_ok();
+    let indices = table.list_indices().await?;
+    let readiness_index_ready = readiness_column_exists
+        && indices.iter().any(|index| {
+            index
+                .columns
+                .iter()
+                .any(|column| column == &readiness_column)
+        });
+    let vector_index = indices
+        .iter()
+        .find(|index| index.columns.iter().any(|column| column == &vector_column));
+    let embedded_vectors = if readiness_index_ready {
+        table
+            .count_rows(Some(format!("{readiness_column} = true")))
+            .await?
+    } else {
+        0
+    };
+    let indexed_vectors = vector_index
+        .and_then(|index| index.num_indexed_rows)
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(0);
+    let unindexed_vectors = embedded_vectors.saturating_sub(indexed_vectors);
+    let vector_index_ready =
+        embedded_vectors > 0 && vector_index.is_some() && indexed_vectors >= embedded_vectors;
+    Ok(AbstractVectorIndexStatus {
+        embedding_model: embedding_model.to_owned(),
+        vector_column,
+        vector_column_exists,
+        readiness_column,
+        readiness_index_ready,
+        has_embeddings: embedded_vectors > 0,
+        embedded_vectors,
+        indexed_vectors,
+        unindexed_vectors,
+        vector_index_ready,
+    })
+}
+
+pub async fn ensure_embedding_ready_index(
+    table: &Table,
+    embedding_model: &str,
+) -> PipelineResult<()> {
+    let column = embedding_ready_column_name(embedding_model);
+    let schema = table.schema().await?;
+    schema.field_with_name(&column)?;
+    if table
+        .list_indices()
+        .await?
+        .iter()
+        .any(|index| index.columns.iter().any(|indexed| indexed == &column))
+    {
+        return Ok(());
+    }
+    table
+        .create_index(
+            &[column.as_str()],
+            Index::Bitmap(BitmapIndexBuilder::default()),
+        )
         .execute()
         .await?;
-    let Some(batch) = rows.next().await else {
-        return Err(format!("metadata missing for {paper_id}").into());
-    };
-    let batch = batch?;
-    let values = batch
-        .column_by_name("abstract")
-        .ok_or("metadata table missing abstract")?;
-    if batch.num_rows() == 0 || values.is_null(0) {
-        return Err(format!("abstract missing for {paper_id}").into());
+    Ok(())
+}
+
+async fn metadata_abstracts(
+    table: &Table,
+    paper_ids: &[&str],
+) -> PipelineResult<HashMap<String, String>> {
+    if paper_ids.is_empty() {
+        return Ok(HashMap::new());
     }
-    Ok(utf8_at(values.as_ref(), 0)?.to_owned())
+    let ids = paper_ids
+        .iter()
+        .map(|paper_id| format!("'{}'", paper_id.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut rows = table
+        .query()
+        .only_if(format!("paper_id IN ({ids})"))
+        .select(Select::columns(&["paper_id", "abstract"]))
+        .limit(paper_ids.len())
+        .execute()
+        .await?;
+    let mut abstracts = HashMap::with_capacity(paper_ids.len());
+    while let Some(batch) = rows.next().await {
+        let batch = batch?;
+        let ids = batch
+            .column_by_name("paper_id")
+            .ok_or("metadata table missing paper_id")?;
+        let values = batch
+            .column_by_name("abstract")
+            .ok_or("metadata table missing abstract")?;
+        for row in 0..batch.num_rows() {
+            let paper_id = utf8_at(ids.as_ref(), row)?.to_owned();
+            if values.is_null(row) {
+                return Err(format!("abstract missing for {paper_id}").into());
+            }
+            abstracts.insert(paper_id, utf8_at(values.as_ref(), row)?.to_owned());
+        }
+    }
+    Ok(abstracts)
 }
 
 async fn ensure_vector_index_for_table(table: &Table, embedding_model: &str) -> PipelineResult<()> {
@@ -1272,8 +1514,8 @@ pub fn vector_column_name(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HybridPipeline, TableNames, embed_abstract_batch, ensure_abstract_vector_index,
-        vector_column_name,
+        HybridPipeline, TableNames, abstract_vector_index_status, embed_abstract_batch,
+        ensure_abstract_vector_index, vector_column_name,
     };
     use crate::test_pipeline::{Embedder, EmbeddingTask, ModelFuture, PipelineResult, Reranker};
     use lancedb::{
@@ -1282,6 +1524,7 @@ mod tests {
             arrow_schema::{DataType, Field, Schema},
         },
         connect,
+        table::{OptimizeAction, OptimizeOptions},
     };
     use std::sync::Arc;
 
@@ -1536,17 +1779,6 @@ mod tests {
             .await?
                 == 0
         );
-        assert!(
-            embed_abstract_batch(
-                &metadata,
-                &[("paper-2".to_owned(), "unrelated topic".to_owned())],
-                "mock-embedding",
-                32_768,
-                &MockEmbedder,
-            )
-            .await?
-                == 1
-        );
         let abstract_schema = metadata.schema().await?;
         assert_eq!(metadata.count_rows(None).await?, 2);
         assert!(
@@ -1560,8 +1792,9 @@ mod tests {
                 .field_with_name(&vector_column_name("mock-embedding"))
                 .is_ok()
         );
-        ensure_abstract_vector_index(&metadata, "mock-embedding").await?;
-
+        let before_index = abstract_vector_index_status(&metadata, "mock-embedding").await?;
+        assert!(before_index.has_embeddings);
+        assert!(!before_index.vector_index_ready);
         let pipeline = HybridPipeline::new(
             &database,
             TableNames {
@@ -1577,7 +1810,7 @@ mod tests {
                 Arc::new(StringArray::from(vec!["paper-1", "paper-2"])),
                 Arc::new(StringArray::from(vec![
                     "relevant full text result",
-                    "other full text result",
+                    "relevant but unembedded full text result",
                 ])),
             ],
         )?;
@@ -1589,6 +1822,24 @@ mod tests {
             .create_index(&["text"], lancedb::index::Index::FTS(Default::default()))
             .execute()
             .await?;
+        let search_without_vector_index = pipeline
+            .search_abstract(
+                &full_text,
+                "metadata_test",
+                "relevant",
+                "mock-embedding",
+                None,
+                10,
+                32_768,
+                &MockEmbedder,
+            )
+            .await;
+        assert!(
+            search_without_vector_index
+                .err()
+                .is_some_and(|error| error.to_string().contains("vector index is not ready"))
+        );
+        ensure_abstract_vector_index(&metadata, "mock-embedding").await?;
         let result = pipeline
             .search_abstract(
                 &full_text,
@@ -1618,6 +1869,41 @@ mod tests {
                 .len(),
             result.hits.len()
         );
+        let indexed = abstract_vector_index_status(&metadata, "mock-embedding").await?;
+        assert!(indexed.vector_index_ready);
+        assert_eq!(
+            embed_abstract_batch(
+                &metadata,
+                &[("paper-2".to_owned(), "unrelated topic".to_owned())],
+                "mock-embedding",
+                32_768,
+                &MockEmbedder,
+            )
+            .await?,
+            1
+        );
+        let after_upsert = abstract_vector_index_status(&metadata, "mock-embedding").await?;
+        assert_eq!(after_upsert.embedded_vectors, 2);
+        assert!(!after_upsert.vector_index_ready);
+        assert_eq!(after_upsert.unindexed_vectors, 1);
+        let vector_index = metadata
+            .list_indices()
+            .await?
+            .into_iter()
+            .find(|index| {
+                index
+                    .columns
+                    .iter()
+                    .any(|column| column == &vector_column_name("mock-embedding"))
+            })
+            .ok_or("vector index disappeared after upsert")?;
+        metadata
+            .optimize(OptimizeAction::Index(
+                OptimizeOptions::new().index_names(vec![vector_index.name]),
+            ))
+            .await?;
+        let after_optimize = abstract_vector_index_status(&metadata, "mock-embedding").await?;
+        assert!(after_optimize.vector_index_ready);
         Ok(())
     }
 }

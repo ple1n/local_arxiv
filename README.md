@@ -113,16 +113,20 @@ The database path and table names remain backend environment settings:
 - `dataset_status()`: report the configured table and its row count.
 
 The paper reader's **Chunk paper** action previews chunk boundaries.
-The **index** button queues a backend job; the browser subscribes to its progress
-stream and does not issue embedding batches itself. The main **index** button
+The main search UI's **Embedded only** toggle searches the selected abstract
+embedding subset; with an empty query it browses embedded papers in pages.
+The **Embed** button queues a backend job; the browser subscribes to its progress
+stream and does not issue embedding batches itself. The main **Embed** button
 queues pending papers according to the selected embedding mode; the reader's
-**index** button queues the selected paper. Abstract-only mode is selected by
+**Embed** button queues the selected paper. Abstract-only mode is selected by
 default. Full-text mode indexes
 papers not marked chunked and embedded in the main text table. Abstract mode
 adds model-specific vector columns directly to `arxiv_metadata`; null vectors
-mark pending papers, with no extra status fields. The Web UI's **Embedding mode** selector
-controls both indexing and hybrid dense search; changing modes never changes
-the full-text BM25 search path.
+and a model-specific readiness flag identify completed embeddings. The **Index
+not ready** action explicitly builds or updates the abstract vector index; a
+hybrid search never creates an index or falls back to a table scan. The Web UI's
+**Embedding mode** selector controls embedding and hybrid dense search; changing
+modes never changes the full-text BM25 search path.
 
 The main text table stores nullable `chunked` and `embedded` flags, model ID,
 chunk counts, and the latest indexing error. Boolean bitmap indexes support
@@ -131,7 +135,9 @@ updates. A paper already marked `chunked` bypasses chunk creation/upsert and
 resumes embedding only for chunks missing vectors. Progress survives backend
 restarts in these per-paper fields; starting a new job resumes unfinished work.
 Batch embedding failures are retried per chunk so one bad passage does not mark
-its whole batch as failed. The vector index is finalized after the job.
+its whole batch as failed. Full-text vector indexes are finalized after their
+embedding job; abstract embedding and vector-index creation are separate
+operations.
 
 The query button uses LanceDB BM25 full-text search and vector search over the
 global chunk table in full-text mode, fusing the two ranked lists with RRF
@@ -146,11 +152,12 @@ does not begin automatically on server startup.
 The text and metadata live in separate LanceDB tables with native columns,
 linked by `paper_id`. Full-text search is indexed on `text`; the metadata table
 has a B-tree index on `paper_id`. Metadata is looked up by ID and added to the
-MCP response; it is not concatenated into a stored blob. Abstract vectors use a
-the metadata table stores model-specific abstract-vector columns alongside its
-existing fields. Abstract text remains sourced from metadata, so it is not
-duplicated. Null vector values mean pending, and indexing progress is derived
-from vector presence rather than extra status fields.
+MCP response; it is not concatenated into a stored blob. The metadata table
+stores model-specific abstract-vector columns alongside its existing fields.
+Abstract text remains sourced from metadata, so it is not duplicated. A
+model-specific nullable readiness flag is set with each vector upsert and has
+a bitmap index; pending work and indexed coverage use that flag without
+scanning the full metadata table.
 
 The MCP tools only see data already present in the selected LanceDB tables.
 Sample-scale and full-corpus ingestion use the same table names and shared

@@ -16,7 +16,7 @@ use lancedb::{
         scalar::{BTreeIndexBuilder, BitmapIndexBuilder, FullTextSearchQuery},
     },
     query::{ExecutableQuery, QueryBase, Select},
-    table::NewColumnTransform,
+    table::{NewColumnTransform, OptimizeAction, OptimizeOptions},
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -361,6 +361,28 @@ struct SearchArgs {
     limit: Option<usize>,
     #[schemars(description = "Number of matching results to skip; defaults to 0")]
     offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct EmbeddedSearchArgs {
+    #[schemars(
+        description = "Optional search text; empty query browses papers with vectors for the selected embedding model"
+    )]
+    query: Option<String>,
+    #[schemars(
+        description = "Embedding model whose non-null vectors define the searchable subset"
+    )]
+    embedding_model: Option<String>,
+    #[schemars(description = "Maximum results to return, from 1 to 10")]
+    limit: Option<usize>,
+    #[schemars(description = "Number of results to skip")]
+    offset: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct AbstractIndexArgs {
+    #[schemars(description = "Embedding model whose abstract vector index is checked or built")]
+    embedding_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -841,17 +863,14 @@ impl ArxivMcpServer {
                 progress.phase_total = None;
             })
             .await;
-        let vector_column = crate::hybrid_pipeline::vector_column_name(&self.embedding_model);
-        let has_vector_column = table
-            .schema()
-            .await?
-            .field_with_name(&vector_column)
-            .is_ok();
+        let ready_column =
+            crate::hybrid_pipeline::embedding_ready_column_name(&self.embedding_model);
+        let has_ready_column = table.schema().await?.field_with_name(&ready_column).is_ok();
         let mut filters = Vec::new();
         if let Some(id) = &paper_id {
             filters.push(format!("paper_id = {}", sql_string(id)));
-        } else if has_vector_column {
-            filters.push(format!("{vector_column} IS NULL"));
+        } else if has_ready_column {
+            filters.push(format!("{ready_column} IS NULL OR {ready_column} = false"));
         }
         let filter = (!filters.is_empty()).then(|| filters.join(" AND "));
         let total = table.count_rows(filter.clone()).await?;
@@ -946,16 +965,6 @@ impl ArxivMcpServer {
                 progress.failed_papers = failed_count;
             })
             .await;
-        if embedded_count > 0 {
-            self.index_jobs
-                .update(|progress| {
-                    progress.phase = Some("Building abstract vector index".to_owned());
-                    progress.current_paper = None;
-                })
-                .await;
-            crate::hybrid_pipeline::ensure_abstract_vector_index(table, &self.embedding_model)
-                .await?;
-        }
         Ok(())
     }
 
@@ -1212,6 +1221,7 @@ impl ArxivMcpServer {
         if query.is_empty() {
             return Err(McpError::invalid_params("query must not be empty", None));
         }
+
         if query.len() > 512 {
             return Err(McpError::invalid_params(
                 "query must be at most 512 bytes",
@@ -1285,6 +1295,275 @@ impl ArxivMcpServer {
             results: hits,
         };
         serde_json::to_string_pretty(&response).map_err(internal_error)
+    }
+
+    #[tool(
+        description = "Browse or hybrid-search papers with abstract embeddings for a model. An empty query browses the embedded subset."
+    )]
+    async fn search_embedded_papers(
+        &self,
+        Parameters(args): Parameters<EmbeddedSearchArgs>,
+    ) -> Result<String, McpError> {
+        let started_at = Instant::now();
+        let query = args.query.as_deref().unwrap_or("").trim();
+        if query.len() > 2_000 {
+            return Err(McpError::invalid_params(
+                "query must be at most 2000 bytes",
+                None,
+            ));
+        }
+        let limit = args.limit.unwrap_or(10).min(MAX_SEARCH_RESULTS);
+        if limit == 0 {
+            return Err(McpError::invalid_params("limit must be at least 1", None));
+        }
+        let offset = args.offset.unwrap_or(0);
+        let model = args
+            .embedding_model
+            .as_deref()
+            .unwrap_or(&self.embedding_model);
+        if model.trim().is_empty() || model.len() > 512 {
+            return Err(McpError::invalid_params("embedding_model is invalid", None));
+        }
+        let ready_column = crate::hybrid_pipeline::embedding_ready_column_name(model);
+        eprintln!(
+            "[embedded-search] start mode={} model={model:?} query_chars={} offset={offset} limit={limit}",
+            if query.is_empty() { "browse" } else { "hybrid" },
+            query.chars().count()
+        );
+        self.metadata_table
+            .schema()
+            .await
+            .map_err(internal_error)?
+            .field_with_name(&ready_column)
+            .map_err(internal_error)?;
+
+        let (results, has_more) = if query.is_empty() {
+            let browse_started = Instant::now();
+            eprintln!("[embedded-search] browse query started readiness_column={ready_column}");
+            let mut rows = self
+                .metadata_table
+                .query()
+                .only_if(format!("{ready_column} = true"))
+                .select(Select::columns(&["paper_id", "abstract"]))
+                .limit(limit.saturating_add(1))
+                .offset(offset)
+                .execute()
+                .await
+                .map_err(internal_error)?;
+            let mut hits = Vec::new();
+            let mut scanned_rows = 0usize;
+            while let Some(batch) = rows.next().await {
+                let batch = batch.map_err(internal_error)?;
+                scanned_rows += batch.num_rows();
+                for row in 0..batch.num_rows() {
+                    let paper_id = string_at(&batch, "paper_id", row)
+                        .map_err(internal_error)?
+                        .ok_or_else(|| internal_error("embedded metadata row has null paper_id"))?;
+                    let snippet = string_at(&batch, "abstract", row)
+                        .map_err(internal_error)?
+                        .unwrap_or_default()
+                        .to_owned();
+                    let metadata = self.metadata_for_id(&paper_id).await?;
+                    hits.push(SearchHit {
+                        paper_id,
+                        metadata,
+                        snippet,
+                        snippet_truncated: false,
+                    });
+                }
+            }
+            let has_more = hits.len() > limit;
+            hits.truncate(limit);
+            eprintln!(
+                "[embedded-search] browse query complete elapsed_ms={} rows={} returned={} has_more={has_more}",
+                browse_started.elapsed().as_millis(),
+                scanned_rows,
+                hits.len()
+            );
+            (hits, has_more)
+        } else {
+            let hybrid_started = Instant::now();
+            eprintln!(
+                "[embedded-search] hybrid pipeline started candidate_limit={}",
+                offset.saturating_add(limit).saturating_add(1).min(100)
+            );
+            let database = connect(&self.database_path)
+                .execute()
+                .await
+                .map_err(internal_error)?;
+            let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
+                &database,
+                crate::hybrid_pipeline::TableNames {
+                    chunks: crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE.to_owned(),
+                },
+            );
+            let embedder = self.embedder(model)?;
+            let candidate_limit = offset.saturating_add(limit).saturating_add(1).min(100);
+            let hybrid = pipeline
+                .search_abstract(
+                    &self.table,
+                    &self.metadata_table.name(),
+                    query,
+                    model,
+                    None,
+                    candidate_limit,
+                    self.embedding_ctx,
+                    &embedder,
+                )
+                .await
+                .map_err(internal_error)?;
+            eprintln!(
+                "[embedded-search] hybrid pipeline complete elapsed_ms={} candidates={}",
+                hybrid_started.elapsed().as_millis(),
+                hybrid.hits.len()
+            );
+            let mut hits = Vec::new();
+            for hit in hybrid.hits.into_iter().skip(offset).take(limit + 1) {
+                let metadata = self.metadata_for_id(&hit.paper_id).await?;
+                let (snippet, snippet_truncated) =
+                    search_excerpt(&hit.text, query, SEARCH_SNIPPET_CHARS);
+                hits.push(SearchHit {
+                    paper_id: hit.paper_id,
+                    metadata,
+                    snippet,
+                    snippet_truncated,
+                });
+            }
+            let has_more = hits.len() > limit;
+            hits.truncate(limit);
+            eprintln!(
+                "[embedded-search] result metadata complete returned={} has_more={has_more}",
+                hits.len()
+            );
+            (hits, has_more)
+        };
+        let result_count = results.len();
+        let next_offset = offset.saturating_add(result_count);
+        let response = SearchResponse {
+            search_url: format!(
+                "/?tool=search_embedded_papers&embedded_only=1&query={}&embedding_model={}&limit={limit}&offset={offset}",
+                Self::encode_query_parameter(query),
+                Self::encode_query_parameter(model),
+            ),
+            metadata: SearchMetadata {
+                lookup_time_ms: started_at.elapsed().as_millis() as u64,
+                result_count,
+                offset,
+                next_offset,
+                has_more,
+            },
+            results,
+        };
+        eprintln!(
+            "[embedded-search] complete elapsed_ms={} result_count={} has_more={has_more}",
+            started_at.elapsed().as_millis(),
+            response.metadata.result_count
+        );
+        serde_json::to_string_pretty(&response).map_err(internal_error)
+    }
+
+    #[tool(
+        description = "Report whether model-specific abstract embeddings exist and whether all of them are covered by the vector index."
+    )]
+    async fn abstract_embedding_index_status(
+        &self,
+        Parameters(args): Parameters<AbstractIndexArgs>,
+    ) -> Result<String, McpError> {
+        let model = args
+            .embedding_model
+            .as_deref()
+            .unwrap_or(&self.embedding_model);
+        if model != self.embedding_model {
+            return Err(McpError::invalid_params(
+                "embedding_model must match the configured local embedding model",
+                None,
+            ));
+        }
+        let status =
+            crate::hybrid_pipeline::abstract_vector_index_status(&self.metadata_table, model)
+                .await
+                .map_err(internal_error)?;
+        serde_json::to_string(&status).map_err(internal_error)
+    }
+
+    #[tool(
+        description = "Build or update the abstract vector index for the configured embedding model. This operation may take time and is separate from embedding."
+    )]
+    async fn build_abstract_vector_index(
+        &self,
+        Parameters(args): Parameters<AbstractIndexArgs>,
+    ) -> Result<String, McpError> {
+        let model = args
+            .embedding_model
+            .as_deref()
+            .unwrap_or(&self.embedding_model);
+        if model != self.embedding_model {
+            return Err(McpError::invalid_params(
+                "embedding_model must match the configured local embedding model",
+                None,
+            ));
+        }
+        let status =
+            crate::hybrid_pipeline::abstract_vector_index_status(&self.metadata_table, model)
+                .await
+                .map_err(internal_error)?;
+        if !status.has_embeddings {
+            return Err(McpError::invalid_params(
+                "no indexed abstract embeddings are available yet",
+                None,
+            ));
+        }
+        if status.vector_index_ready {
+            return serde_json::to_string(&status).map_err(internal_error);
+        }
+
+        let vector_column = crate::hybrid_pipeline::vector_column_name(model);
+        let indices = self
+            .metadata_table
+            .list_indices()
+            .await
+            .map_err(internal_error)?;
+        let vector_index = indices
+            .iter()
+            .find(|index| index.columns.iter().any(|column| column == &vector_column));
+        let started_at = Instant::now();
+        if let Some(index) = vector_index {
+            eprintln!(
+                "[abstract-vector-index] optimize started model={model:?} index={} embedded={} unindexed={}",
+                index.name, status.embedded_vectors, status.unindexed_vectors
+            );
+            self.metadata_table
+                .optimize(OptimizeAction::Index(
+                    OptimizeOptions::new().index_names(vec![index.name.clone()]),
+                ))
+                .await
+                .map_err(internal_error)?;
+        } else {
+            eprintln!(
+                "[abstract-vector-index] build started model={model:?} column={vector_column} embedded={}",
+                status.embedded_vectors
+            );
+            crate::hybrid_pipeline::ensure_abstract_vector_index(&self.metadata_table, model)
+                .await
+                .map_err(internal_error)?;
+        }
+        let final_status =
+            crate::hybrid_pipeline::abstract_vector_index_status(&self.metadata_table, model)
+                .await
+                .map_err(internal_error)?;
+        eprintln!(
+            "[abstract-vector-index] complete elapsed_ms={} indexed={} unindexed={}",
+            started_at.elapsed().as_millis(),
+            final_status.indexed_vectors,
+            final_status.unindexed_vectors
+        );
+        if !final_status.vector_index_ready {
+            return Err(internal_error(format!(
+                "vector index operation finished but {} vectors remain unindexed",
+                final_status.unindexed_vectors
+            )));
+        }
+        serde_json::to_string(&final_status).map_err(internal_error)
     }
 
     fn encode_query_parameter(value: &str) -> String {

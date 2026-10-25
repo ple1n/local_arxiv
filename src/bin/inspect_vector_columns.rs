@@ -25,9 +25,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fields()
         .iter()
         .filter_map(|field| match field.data_type() {
-            DataType::FixedSizeList(item, dimensions)
-                if item.data_type() == &DataType::Float32 =>
-            {
+            DataType::FixedSizeList(item, dimensions) if item.data_type() == &DataType::Float32 => {
                 Some((field.name().clone(), *dimensions as usize))
             }
             _ => None,
