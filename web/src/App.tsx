@@ -1125,8 +1125,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                     ? "Embedding…"
                     : "Embed"}
           </button>
-          {embeddedOnly &&
-            abstractEmbeddingIndexStatus?.has_embeddings &&
+          {abstractEmbeddingIndexStatus?.has_embeddings &&
             !abstractEmbeddingIndexStatus.vector_index_ready && (
               <button
                 className="chunk-button"
