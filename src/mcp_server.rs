@@ -3,7 +3,7 @@ use crate::test_pipeline::Embedder;
 use axum::{
     Json, Router,
     extract::Path,
-    http::HeaderName,
+    http::{HeaderName, StatusCode},
     response::sse::{Event, KeepAlive, Sse},
     routing::get,
 };
@@ -31,7 +31,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, HashMap, VecDeque},
     env,
     error::Error,
     net::{IpAddr, SocketAddr},
@@ -293,6 +293,41 @@ impl IndexJobManager {
             .await
             .clone()
             .filter(|progress| matches!(progress.state.as_str(), "queued" | "running" | "paused"))
+    }
+}
+
+#[derive(Clone, Default)]
+struct IndexBuildProgressHub {
+    updates: Arc<RwLock<HashMap<String, broadcast::Sender<IndexBuildProgress>>>>,
+}
+
+impl IndexBuildProgressHub {
+    async fn subscribe(
+        &self,
+        job_id: &str,
+    ) -> Result<broadcast::Receiver<IndexBuildProgress>, String> {
+        let mut updates = self.updates.write().await;
+        if updates.contains_key(job_id) {
+            return Err(format!("Index build job {job_id:?} is already registered"));
+        }
+        let (sender, receiver) = broadcast::channel(64);
+        updates.insert(job_id.to_owned(), sender);
+        Ok(receiver)
+    }
+
+    async fn publish(&self, update: IndexBuildProgress) -> Result<(), String> {
+        let updates = self.updates.read().await;
+        let sender = updates
+            .get(&update.job_id)
+            .ok_or_else(|| format!("No active index build for {:?}", update.job_id))?;
+        sender
+            .send(update)
+            .map(|_| ())
+            .map_err(|error| format!("Index build progress receiver unavailable: {error}"))
+    }
+
+    async fn remove(&self, job_id: &str) {
+        self.updates.write().await.remove(job_id);
     }
 }
 
@@ -606,6 +641,7 @@ struct ArxivMcpServer {
     embedding_ctx: usize,
     embedding_max_tokens: usize,
     index_jobs: IndexJobManager,
+    index_build_progress: IndexBuildProgressHub,
     #[expect(dead_code, reason = "tool_handler macro reads this router")]
     tool_router: ToolRouter<Self>,
 }
@@ -621,11 +657,13 @@ impl ArxivMcpServer {
         embedding: EmbeddingModelConfig,
         embedding_endpoint: String,
         python_indexer_endpoint: String,
+        python_indexer_callback_endpoint: String,
         model_list_endpoint: String,
         reranker_endpoint: String,
         embedding_tokenizer: Arc<Tokenizer>,
         embedding_scheduler: Arc<Semaphore>,
         index_jobs: IndexJobManager,
+        index_build_progress: IndexBuildProgressHub,
     ) -> Self {
         Self {
             table,
@@ -636,7 +674,10 @@ impl ArxivMcpServer {
             database_path,
             embedding_model: embedding.id,
             embedding_endpoint,
-            python_indexer: PythonIndexClient::new(python_indexer_endpoint),
+            python_indexer: PythonIndexClient::new(
+                python_indexer_endpoint,
+                python_indexer_callback_endpoint,
+            ),
             model_list_endpoint,
             reranker_endpoint,
             embedding_tokenizer,
@@ -644,6 +685,7 @@ impl ArxivMcpServer {
             embedding_ctx: DEFAULT_EMBEDDING_CTX,
             embedding_max_tokens: embedding.max_tokens,
             index_jobs,
+            index_build_progress,
             tool_router: Self::tool_router(),
         }
     }
@@ -682,32 +724,61 @@ impl ArxivMcpServer {
                     NEXT_INDEX_JOB_ID.fetch_add(1, Ordering::Relaxed)
                 )
             });
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        let client = self.python_indexer.clone();
-        let database_path = self.database_path.clone();
-        let table_name = table_name.to_owned();
-        let column_name = column_name.to_owned();
-        let worker_job_id = job_id.clone();
-        let worker = tokio::spawn(async move {
-            client
-                .build_index(
-                    &worker_job_id,
-                    &database_path,
-                    &table_name,
-                    &column_name,
-                    progress_tx,
-                )
-                .await
-        });
-
-        while let Some(update) = progress_rx.recv().await {
-            self.update_index_build_progress(&job_id, update).await;
+        let mut progress = self
+            .index_build_progress
+            .subscribe(&job_id)
+            .await
+            .map_err(std::io::Error::other)?;
+        let result = async {
+            self.python_indexer
+                .start_index(&job_id, &self.database_path, table_name, column_name)
+                .await?;
+            loop {
+                let update = progress.recv().await.map_err(|error| {
+                    std::io::Error::other(format!("Python index progress stream failed: {error}"))
+                })?;
+                let state = update.state.clone();
+                self.update_index_build_progress(&job_id, update.clone())
+                    .await;
+                match state.as_str() {
+                    "completed" => {
+                        eprintln!("[gpu-vector-index] Python worker finished job_id={job_id}");
+                        return Ok(());
+                    }
+                    "failed" => {
+                        return Err(format!(
+                            "Python IVF-PQ build failed: {}",
+                            update.error.as_deref().unwrap_or("unknown error")
+                        )
+                        .into());
+                    }
+                    "queued" | "running" => {}
+                    unexpected => {
+                        return Err(format!(
+                            "Python indexer returned unexpected job state {unexpected:?}"
+                        )
+                        .into());
+                    }
+                }
+            }
         }
-        worker.await??;
-        Ok(())
+        .await;
+        self.index_build_progress.remove(&job_id).await;
+        result
     }
 
     async fn update_index_build_progress(&self, job_id: &str, update: IndexBuildProgress) {
+        if matches!(update.state.as_str(), "completed" | "failed") {
+            eprintln!(
+                "[gpu-vector-index] Python worker state={} job_id={} stage={:?} completed={:?} total={:?} error={:?}",
+                update.state,
+                update.job_id,
+                update.stage,
+                update.completed,
+                update.total,
+                update.error
+            );
+        }
         if self
             .index_jobs
             .current()
@@ -748,7 +819,14 @@ impl ArxivMcpServer {
                 && index.columns.iter().any(|column| column == &column_name)
         });
         let index_is_current = if let Some(index) = existing_index {
-            table.index_stats(&index.name).await?.is_some_and(|stats| {
+            let stats = table.index_stats(&index.name).await?;
+            if let Some(stats) = &stats {
+                eprintln!(
+                    "[gpu-vector-index] existing index stats name={:?} covered_table_rows={} unindexed_table_rows={}",
+                    index.name, stats.num_indexed_rows, stats.num_unindexed_rows
+                );
+            }
+            stats.is_some_and(|stats| {
                 stats.num_indexed_rows >= vector_count && stats.num_unindexed_rows == 0
             })
         } else {
@@ -784,12 +862,16 @@ impl ArxivMcpServer {
                     && index.columns.iter().any(|column| column == &column_name)
             });
         let index_is_current = if let Some(index) = rebuilt_index {
-            refreshed_table
-                .index_stats(&index.name)
-                .await?
-                .is_some_and(|stats| {
-                    stats.num_indexed_rows >= vector_count && stats.num_unindexed_rows == 0
-                })
+            let stats = refreshed_table.index_stats(&index.name).await?;
+            if let Some(stats) = &stats {
+                eprintln!(
+                    "[gpu-vector-index] rebuilt index stats name={:?} covered_table_rows={} unindexed_table_rows={} vector_count={vector_count}",
+                    index.name, stats.num_indexed_rows, stats.num_unindexed_rows
+                );
+            }
+            stats.is_some_and(|stats| {
+                stats.num_indexed_rows >= vector_count && stats.num_unindexed_rows == 0
+            })
         } else {
             false
         };
@@ -1679,6 +1761,33 @@ impl ArxivMcpServer {
     }
 
     #[tool(
+        description = "Report abstract embedding and IVF-PQ index counts for every model with a vector column in the metadata table."
+    )]
+    async fn abstract_embedding_index_stats(&self) -> Result<String, McpError> {
+        let metadata_table = self
+            .open_fresh_metadata_table()
+            .await
+            .map_err(internal_error)?;
+        let schema = metadata_table.schema().await.map_err(internal_error)?;
+        let mut models = BTreeSet::from([self.embedding_model.clone()]);
+        models.extend(
+            schema
+                .fields()
+                .iter()
+                .filter_map(|field| model_from_vector_column(field.name())),
+        );
+        let mut statuses = Vec::with_capacity(models.len());
+        for model in models {
+            statuses.push(
+                crate::hybrid_pipeline::abstract_vector_index_status(&metadata_table, &model)
+                    .await
+                    .map_err(internal_error)?,
+            );
+        }
+        serde_json::to_string_pretty(&statuses).map_err(internal_error)
+    }
+
+    #[tool(
         description = "Build or update the abstract vector index for the configured embedding model. This operation may take time and is separate from embedding."
     )]
     async fn build_abstract_vector_index(
@@ -1719,9 +1828,13 @@ impl ArxivMcpServer {
         );
         let table_name =
             env::var("ARXIV_METADATA_TABLE").unwrap_or_else(|_| "arxiv_metadata".to_owned());
-        self.ensure_gpu_vector_index(&table_name, model)
-            .await
-            .map_err(internal_error)?;
+        if let Err(error) = self.ensure_gpu_vector_index(&table_name, model).await {
+            eprintln!(
+                "[abstract-vector-index] GPU IVF-PQ build failed elapsed_ms={} error={error}",
+                started_at.elapsed().as_millis()
+            );
+            return Err(internal_error(error));
+        }
         let refreshed_metadata_table = self
             .open_fresh_metadata_table()
             .await
@@ -2535,6 +2648,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     }
     let metadata_row_count = metadata_table.count_rows(None).await?;
     let index_jobs = IndexJobManager::new();
+    let index_build_progress = IndexBuildProgressHub::default();
     let server = ArxivMcpServer::new(
         table,
         metadata_table,
@@ -2548,6 +2662,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             SocketAddr::new(config.llama.host, config.llama.port)
         ),
         format!("http://127.0.0.1:{}", config.embedding.port),
+        format!("http://127.0.0.1:{}", config.backend.port),
         format!(
             "http://{}/v1/models",
             SocketAddr::new(config.llama.host, config.llama.port)
@@ -2559,6 +2674,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         tokenizer,
         Arc::new(Semaphore::new(1)),
         index_jobs.clone(),
+        index_build_progress.clone(),
     );
 
     let service: StreamableHttpService<ArxivMcpServer, LocalSessionManager> =
@@ -2585,6 +2701,28 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 let manager = event_jobs.clone();
                 async move { index_job_events(manager, job_id).await }
             }),
+        )
+        .route(
+            "/index-builds/{job_id}/progress",
+            axum::routing::post(
+                move |Path(job_id): Path<String>, Json(update): Json<IndexBuildProgress>| {
+                    let progress_hub = index_build_progress.clone();
+                    async move {
+                        if update.job_id != job_id {
+                            return StatusCode::BAD_REQUEST;
+                        }
+                        match progress_hub.publish(update).await {
+                            Ok(()) => StatusCode::ACCEPTED,
+                            Err(error) => {
+                                eprintln!(
+                                    "[gpu-vector-index] rejected Python progress callback: {error}"
+                                );
+                                StatusCode::NOT_FOUND
+                            }
+                        }
+                    }
+                },
+            ),
         )
         .route(
             "/runtime-config.json",
@@ -2785,6 +2923,23 @@ fn internal_error(error: impl std::fmt::Display) -> McpError {
     McpError::internal_error(error.to_string(), None)
 }
 
+fn model_from_vector_column(column: &str) -> Option<String> {
+    let encoded = column.strip_prefix("embedding_")?;
+    let bytes = encoded.as_bytes();
+    if bytes.is_empty() || bytes.len() % 2 != 0 || !bytes.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let decoded = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let pair = std::str::from_utf8(pair).ok()?;
+            u8::from_str_radix(pair, 16).ok()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let model = String::from_utf8(decoded).ok()?;
+    (!model.is_empty()).then_some(model)
+}
+
 async fn index_job_events(
     manager: IndexJobManager,
     job_id: String,
@@ -2842,8 +2997,9 @@ fn validate_embedding_ctx(ctx: usize) -> Result<usize, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_EMBEDDING_CTX, IndexJobManager, MAX_LFM_EMBEDDING_TOKENS, SEARCH_SNIPPET_CHARS,
-        ensure_indexing_state_fields, pending_index_filter, search_excerpt, sql_string,
+        DEFAULT_EMBEDDING_CTX, IndexBuildProgress, IndexBuildProgressHub, IndexJobManager,
+        MAX_LFM_EMBEDDING_TOKENS, SEARCH_SNIPPET_CHARS, ensure_indexing_state_fields,
+        model_from_vector_column, pending_index_filter, search_excerpt, sql_string,
         update_paper_index_state, validate_embedding_ctx,
     };
     use lancedb::{
@@ -2854,6 +3010,36 @@ mod tests {
         connect,
     };
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn index_build_progress_is_pushed_to_registered_subscribers() {
+        let hub = IndexBuildProgressHub::default();
+        let mut updates = hub.subscribe("job-1").await.unwrap();
+        hub.publish(IndexBuildProgress {
+            job_id: "job-1".to_owned(),
+            state: "completed".to_owned(),
+            stage: "Index committed".to_owned(),
+            completed: Some(1),
+            total: Some(1),
+            error: None,
+        })
+        .await
+        .unwrap();
+
+        let update = updates.recv().await.unwrap();
+        assert_eq!(update.state, "completed");
+        assert_eq!(update.stage, "Index committed");
+    }
+
+    #[test]
+    fn discovers_model_names_from_embedding_vector_columns() {
+        assert_eq!(
+            model_from_vector_column("embedding_4c464d2d456d62656464696e672d51344b4d"),
+            Some("LFM-Embedding-Q4KM".to_owned())
+        );
+        assert_eq!(model_from_vector_column("embedding_not_hex"), None);
+        assert_eq!(model_from_vector_column("embedding_"), None);
+    }
 
     #[test]
     fn embedding_ctx_accepts_limits_and_rejects_out_of_range_values() {

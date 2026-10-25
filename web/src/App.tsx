@@ -483,6 +483,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [modelChoices, setModelChoices] = useState<ModelChoices>({ embedding: [], reranking: [] });
   const [modelChoicesError, setModelChoicesError] = useState("");
   const [selectedEmbeddingModel, setSelectedEmbeddingModel] = useState("");
+  const [abstractEmbeddingIndexStats, setAbstractEmbeddingIndexStats] =
+    useState<AbstractEmbeddingIndexStatus[]>([]);
   const [abstractEmbeddingIndexStatus, setAbstractEmbeddingIndexStatus] =
     useState<AbstractEmbeddingIndexStatus | null>(null);
   const [abstractIndexBusy, setAbstractIndexBusy] = useState(false);
@@ -664,19 +666,22 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
 
   async function refreshAbstractEmbeddingIndexStatus(model = selectedEmbeddingModel) {
     const client = clientRef.current;
-    if (!client || !model) return;
+    if (!client) return;
     try {
       const response = await client.callTool({
-        name: "abstract_embedding_index_status",
-        arguments: { embedding_model: model },
+        name: "abstract_embedding_index_stats",
+        arguments: {},
       });
-      const indexStatus = JSON.parse(
+      const indexStats = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
-      ) as AbstractEmbeddingIndexStatus;
-      if (indexStatus.embedding_model !== model) return;
-      setAbstractEmbeddingIndexStatus(indexStatus);
+      ) as AbstractEmbeddingIndexStatus[];
+      setAbstractEmbeddingIndexStats(indexStats);
+      setAbstractEmbeddingIndexStatus(
+        indexStats.find((indexStatus) => indexStatus.embedding_model === model) ?? null,
+      );
       setAbstractIndexError("");
     } catch (reason) {
+      setAbstractEmbeddingIndexStats([]);
       setAbstractEmbeddingIndexStatus(null);
       setAbstractIndexError(
         reason instanceof Error ? reason.message : String(reason),
@@ -698,6 +703,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
       ) as AbstractEmbeddingIndexStatus;
       setAbstractEmbeddingIndexStatus(builtStatus);
+      await refreshAbstractEmbeddingIndexStatus(selectedEmbeddingModel);
     } catch (reason) {
       setAbstractIndexError(
         reason instanceof Error ? reason.message : String(reason),
@@ -1168,10 +1174,25 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                 {abstractIndexBusy ? "Building index…" : "Update vector index"}
               </button>
             )}
-          {semanticSearch && abstractIndexError && (
+          {abstractIndexError && (
             <span role="alert">{abstractIndexError}</span>
           )}
         </div>
+        {abstractEmbeddingIndexStats.length > 0 && (
+          <div className="embedding-index-stats" aria-label="Abstract embedding index statistics">
+            <strong>Abstract vectors</strong>
+            {abstractEmbeddingIndexStats.map((indexStatus) => (
+              <span
+                className={indexStatus.vector_index_ready ? "" : "index-stale"}
+                key={indexStatus.embedding_model}
+              >
+                <b>{indexStatus.embedding_model}</b>
+                {` (vectors ${indexStatus.embedded_vectors.toLocaleString()}, indexed ${indexStatus.indexed_vectors.toLocaleString()})`}
+                {!indexStatus.vector_index_ready && " · index stale"}
+              </span>
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="results-section" aria-live="polite">

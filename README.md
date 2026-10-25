@@ -221,8 +221,8 @@ hf download LiquidAI/LFM2.5-Embedding-350M tokenizer.json \
 
 The Rust backend uses `embedding_server.py` only for CUDA IVF-PQ index builds;
 the browser never calls this service. Start it with the `indexer` extra so the
-Python worker can open the existing Lance dataset and report build progress to
-the backend, which relays it through the existing indexing-job event stream:
+Python worker can open the existing Lance dataset and push build progress and
+completion events to the Rust backend. The Rust backend does not poll the worker:
 
 ```sh
 uv run --extra indexer python embedding_server.py

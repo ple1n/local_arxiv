@@ -102,6 +102,7 @@ class IndexJobRequestTests(unittest.TestCase):
                     "database_path": "/tmp/lance",
                     "table_name": "chunks",
                     "column_name": "vector",
+                    "callback_url": "http://127.0.0.1:8250/index-builds/job-1/progress",
                 }
             )
 
@@ -110,6 +111,21 @@ class IndexJobRequestTests(unittest.TestCase):
         status, payload = self.handler._send_json.call_args.args
         self.assertEqual(status, embedding_server.HTTPStatus.ACCEPTED)
         self.assertEqual(payload, {"job_id": "job-1"})
+
+    def test_non_loopback_callback_is_rejected(self):
+        self.handler._start_index_job(
+            {
+                "job_id": "job-2",
+                "database_path": "/tmp/lance",
+                "table_name": "chunks",
+                "column_name": "vector",
+                "callback_url": "http://example.invalid/index-builds/job-2/progress",
+            }
+        )
+
+        status, payload = self.handler._send_json.call_args.args
+        self.assertEqual(status, embedding_server.HTTPStatus.BAD_REQUEST)
+        self.assertIn("callback_url", payload["error"])
 
 
 if __name__ == "__main__":

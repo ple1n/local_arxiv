@@ -10,6 +10,7 @@ import math
 import os
 import random
 import re
+import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
@@ -17,6 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock
 from typing import Any
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 MODEL_ID = os.getenv(
     "EMBEDDING_MODEL",
@@ -69,6 +72,28 @@ def _progress_fields(progress: Any) -> tuple[str, int | None, int | None]:
             scale = 1000 if 0.0 <= value <= 1.0 else 1
             return stage, max(0, min(scale, round(value * scale))), scale
     return stage, None, None
+
+
+def _push_index_progress(callback_url: str, progress: dict[str, Any]) -> None:
+    payload = json.dumps(progress, separators=(",", ":")).encode("utf-8")
+    request = Request(
+        callback_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    last_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            with urlopen(request, timeout=5) as response:
+                if not 200 <= response.status < 300:
+                    raise RuntimeError(f"backend returned HTTP {response.status}")
+            return
+        except Exception as exc:
+            last_error = exc
+            if attempt < 4:
+                time.sleep(0.2 * (2**attempt))
+    raise RuntimeError(f"could not push index progress to Rust backend: {last_error}")
 
 
 def _suggest_num_sub_vectors(dimension: int) -> int:
@@ -304,6 +329,7 @@ def _run_index_job(
     database_path: str,
     table_name: str,
     column_name: str,
+    callback_url: str,
 ) -> None:
     def update_progress(progress: Any) -> None:
         stage, completed, total = _progress_fields(progress)
@@ -316,6 +342,11 @@ def _run_index_job(
                     "total": total,
                 }
             )
+            snapshot = dict(job)
+        try:
+            _push_index_progress(callback_url, snapshot)
+        except Exception as exc:
+            print(f"Could not push IVF-PQ progress for job {job_id}: {exc}", flush=True)
 
     try:
         import lancedb
@@ -361,6 +392,8 @@ def _run_index_job(
                 f"GPU IVF-PQ training on {vector_count} scoped vectors "
                 f"({num_partitions} partitions; filter: {scope_description})"
             )
+            snapshot = dict(index_jobs[job_id])
+        _push_index_progress(callback_url, snapshot)
         from lance.torch import kmeans as lance_kmeans
 
         original_tqdm = lance_kmeans.tqdm
@@ -391,6 +424,13 @@ def _run_index_job(
                     "error": None,
                 }
             )
+            snapshot = dict(index_jobs[job_id])
+        _push_index_progress(callback_url, snapshot)
+        print(
+            f"IVF-PQ index job {job_id} committed table={table_name!r} column={column_name!r} "
+            f"vectors={vector_count}",
+            flush=True,
+        )
     except Exception as exc:
         with index_jobs_lock:
             index_jobs[job_id].update(
@@ -399,6 +439,14 @@ def _run_index_job(
                     "stage": "Index build failed",
                     "error": str(exc),
                 }
+            )
+            snapshot = dict(index_jobs[job_id])
+        try:
+            _push_index_progress(callback_url, snapshot)
+        except Exception as callback_error:
+            print(
+                f"Could not push IVF-PQ failure for job {job_id}: {callback_error}",
+                flush=True,
             )
         print(f"IVF-PQ index job {job_id} failed: {exc}", flush=True)
         traceback.print_exc()
@@ -412,26 +460,7 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                 {"status": "ok", "model": MODEL_ID, "model_loaded": model is not None},
             )
             return
-
-        prefix = "/index-jobs/"
-        if not self.path.startswith(prefix):
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
-            return
-        if not _is_loopback_request(self):
-            self._send_json(HTTPStatus.FORBIDDEN, {"error": "Index jobs are loopback-only"})
-            return
-
-        job_id = self.path[len(prefix) :]
-        if not JOB_ID_PATTERN.fullmatch(job_id):
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Invalid job ID"})
-            return
-        with index_jobs_lock:
-            job = index_jobs.get(job_id)
-            if job is None:
-                self._send_json(HTTPStatus.NOT_FOUND, {"error": "Index job not found"})
-                return
-            snapshot = dict(job)
-        self._send_json(HTTPStatus.OK, snapshot)
+        self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def do_POST(self) -> None:
         if self.path not in {"/embed", "/index-jobs"}:
@@ -512,6 +541,22 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
         database_path = payload.get("database_path")
         table_name = payload.get("table_name")
         column_name = payload.get("column_name")
+        callback_url = payload.get("callback_url")
+        parsed_callback = urlparse(callback_url) if isinstance(callback_url, str) else None
+        try:
+            valid_callback = (
+                parsed_callback is not None
+                and parsed_callback.scheme == "http"
+                and parsed_callback.hostname in {"127.0.0.1", "localhost", "::1"}
+                and parsed_callback.port is not None
+                and parsed_callback.path == f"/index-builds/{job_id}/progress"
+                and not parsed_callback.query
+                and not parsed_callback.fragment
+                and parsed_callback.username is None
+                and parsed_callback.password is None
+            )
+        except ValueError:
+            valid_callback = False
         if (
             not isinstance(job_id, str)
             or not JOB_ID_PATTERN.fullmatch(job_id)
@@ -522,10 +567,13 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
             or not table_name.strip()
             or not isinstance(column_name, str)
             or not column_name.strip()
+            or not valid_callback
         ):
             self._send_json(
                 HTTPStatus.BAD_REQUEST,
-                {"error": "Provide a valid job_id, local database_path, table_name, and column_name"},
+                {
+                    "error": "Provide a valid job_id, local database_path, table_name, column_name, and loopback callback_url"
+                },
             )
             return
 
@@ -551,6 +599,7 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                     database_path,
                     table_name,
                     column_name,
+                    callback_url,
                 )
             except RuntimeError as exc:
                 del index_jobs[job_id]

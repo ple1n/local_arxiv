@@ -1358,10 +1358,11 @@ pub async fn abstract_vector_index_status(
     } else {
         None
     };
-    let indexed_vectors = index_stats
+    let indexed_index_rows = index_stats
         .as_ref()
         .map(|stats| stats.num_indexed_rows)
         .unwrap_or(0);
+    let indexed_vectors = indexed_index_rows.min(embedded_vectors);
     let index_unindexed_rows = index_stats
         .as_ref()
         .map(|stats| stats.num_unindexed_rows)
@@ -1369,7 +1370,7 @@ pub async fn abstract_vector_index_status(
     let unindexed_vectors = embedded_vectors.saturating_sub(indexed_vectors);
     let vector_index_ready = embedded_vectors > 0
         && index_stats.is_some()
-        && indexed_vectors >= embedded_vectors
+        && indexed_index_rows >= embedded_vectors
         && index_unindexed_rows == 0;
     Ok(AbstractVectorIndexStatus {
         embedding_model: embedding_model.to_owned(),

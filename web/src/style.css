@@ -57,6 +57,10 @@ button { cursor: pointer; }
 .render-toggle { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .render-toggle input { margin: 0; }
 .planned-toggle { opacity: .65; }
+.embedding-index-stats { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 9px; color: var(--muted); font-size: 11px; }
+.embedding-index-stats strong { color: #333; }
+.embedding-index-stats b { color: #222; font-weight: 600; }
+.embedding-index-stats .index-stale { color: #9a4f00; }
 .results-section { min-height: 220px; padding-bottom: 20px; }
 .results-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
 .results-summary, .results-actions { display: flex; min-width: 0; align-items: center; gap: 10px; }
