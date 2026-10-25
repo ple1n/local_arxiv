@@ -933,6 +933,14 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
           ? { ...current, state: paused ? "paused" : "running" }
           : current,
       );
+      const subscription = indexJobSubscriptionRef.current;
+      if (
+        paused &&
+        subscription?.job.job_id === job.job_id &&
+        subscription.mode === "abstract"
+      ) {
+        await refreshAbstractEmbeddingIndexStatus(subscription.model);
+      }
       if (!paused) {
         setIndexJobMessage("");
       }
@@ -1188,7 +1196,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
               >
                 <b>{indexStatus.embedding_model}</b>
                 {` (vectors ${indexStatus.embedded_vectors.toLocaleString()}, indexed ${indexStatus.indexed_vectors.toLocaleString()})`}
-                {!indexStatus.vector_index_ready && " · index stale"}
+                {!indexStatus.vector_index_ready &&
+                  ` · ${indexStatus.unindexed_vectors.toLocaleString()} unindexed`}
               </span>
             ))}
           </div>
