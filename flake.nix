@@ -13,8 +13,17 @@
     in
     {
       devShells.${system}.default = pkgs.mkShell {
-        packages = [ pkgs.protobuf protocWithIncludes ];
+        packages = [
+          pkgs.openssl
+          pkgs.pkg-config
+          pkgs.protobuf
+          protocWithIncludes
+        ];
         PROTOC = "${protocWithIncludes}/bin/protoc-with-includes";
+        LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+          pkgs.openssl
+          pkgs.stdenv.cc.cc.lib
+        ];
       };
     };
 }

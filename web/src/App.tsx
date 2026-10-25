@@ -43,6 +43,63 @@ type PaperText = {
   max_chars: number;
 };
 
+type EmbeddingStatus = "pending" | "embedding" | "done" | "failed";
+
+type PaperChunk = {
+  chunk_id: string;
+  text: string;
+  byte_range: [number, number];
+  word_count: number;
+  cost: number;
+};
+
+type ChunkItem = PaperChunk & {
+  embeddingStatus: EmbeddingStatus;
+  embeddingError?: string;
+};
+
+type ChunkResponse = {
+  paper_id: string;
+  chunk_table: string;
+  token_budget: number;
+  source_chars: number;
+  source_truncated: boolean;
+  chunks: ChunkItem[];
+};
+
+type ChunkApiResponse = Omit<ChunkResponse, "chunks"> & {
+  chunks: PaperChunk[];
+};
+
+type EmbeddingResponse = {
+  model: string;
+  count: number;
+};
+
+type AvailableModel = {
+  id: string;
+  tags: string[];
+};
+
+type ModelChoices = {
+  embedding: AvailableModel[];
+  reranking: AvailableModel[];
+};
+
+type QueryPipelineResponse = {
+  embedding_model: string;
+  reranker_model: string | null;
+  hits: Array<{
+    chunk_id: string;
+    paper_id: string;
+    text: string;
+    lexical_rank: number | null;
+    semantic_rank: number | null;
+    fused_score: number;
+    rerank_score: number | null;
+  }>;
+};
+
 function getText(result: { content: Array<{ type: string; text?: string }>; isError?: boolean }) {
   if (result.isError) {
     throw new Error(result.content.map((item) => item.text ?? "").join("\n") || "MCP tool failed");
@@ -329,8 +386,9 @@ const paperCss = `
   @media (max-width: 700px) { body { padding: 16px 12px 36px; } }
 `;
 
-function App() {
+function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const initialParams = new URLSearchParams(window.location.search);
+  const serverAddress = new URL(apiBaseUrl).host;
   const clientRef = useRef<Client | null>(null);
   const transportRef = useRef<StreamableHTTPClientTransport | null>(null);
   const [query, setQuery] = useState(initialParams.get("query") ?? "");
@@ -342,14 +400,29 @@ function App() {
   const [selected, setSelected] = useState<PaperText | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const [status, setStatus] = useState("Connecting to :8000…");
+  const [status, setStatus] = useState(`Connecting to ${serverAddress}…`);
   const [renderLatex, setRenderLatex] = useState(false);
+  const [chunkView, setChunkView] = useState(false);
+  const [chunkResult, setChunkResult] = useState<ChunkResponse | null>(null);
+  const [chunkBusy, setChunkBusy] = useState(false);
+  const [embeddingBusy, setEmbeddingBusy] = useState(false);
+  const [chunkError, setChunkError] = useState("");
+  const [embeddingProgress, setEmbeddingProgress] = useState({ completed: 0, total: 0 });
+  const [embeddingModel, setEmbeddingModel] = useState("");
+  const [rerankQuery, setRerankQuery] = useState("");
+  const [queryPipelineBusy, setQueryPipelineBusy] = useState(false);
+  const [queryPipelineResult, setQueryPipelineResult] = useState<QueryPipelineResponse | null>(null);
+  const [modelChoices, setModelChoices] = useState<ModelChoices>({ embedding: [], reranking: [] });
+  const [modelChoicesError, setModelChoicesError] = useState("");
+  const [selectedEmbeddingModel, setSelectedEmbeddingModel] = useState("");
+  const [selectedRerankerModel, setSelectedRerankerModel] = useState("");
+  const [tokenBudget, setTokenBudget] = useState(512);
 
   useEffect(() => {
     let active = true;
     const client = new Client({ name: "arxiv-search-ui", version: "0.1.0" });
     const transport = new StreamableHTTPClientTransport(
-      new URL("http://127.0.0.1:8000/mcp"),
+      new URL(apiBaseUrl),
     );
     clientRef.current = client;
     transportRef.current = transport;
@@ -358,7 +431,7 @@ function App() {
       .connect(transport)
       .then(async () => {
         if (!active) return;
-        setStatus("Connected to :8000");
+        setStatus(`Connected to ${serverAddress}`);
         try {
           const result = await client.callTool({ name: "dataset_status", arguments: {} });
           if (!active) return;
@@ -366,7 +439,32 @@ function App() {
             text_rows: number;
             metadata_rows: number;
           };
-          setStatus(`Connected to :8000 · ${info.text_rows.toLocaleString()} papers · ${info.metadata_rows.toLocaleString()} metadata records`);
+          setStatus(`Connected to ${serverAddress} · ${info.text_rows.toLocaleString()} papers · ${info.metadata_rows.toLocaleString()} metadata records`);
+          try {
+            const modelsResult = await client.callTool({ name: "list_models", arguments: {} });
+            const choices = JSON.parse(
+              getText(modelsResult as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
+            ) as ModelChoices;
+            setModelChoices(choices);
+            setSelectedEmbeddingModel((current) =>
+              choices.embedding.some((model) => model.id === current)
+                ? current
+                : choices.embedding.find((model) => model.id === "Qwen3-Embedding-8B-Q4_KM-32K")?.id
+                  ?? choices.embedding[0]?.id
+                  ?? "",
+            );
+            setSelectedRerankerModel((current) =>
+              choices.reranking.some((model) => model.id === current)
+                ? current
+                : choices.reranking.find((model) => model.id === "Qwen3-Reranker-8B-Q4_K_M-32K")?.id
+                  ?? choices.reranking[0]?.id
+                  ?? "",
+            );
+          } catch (reason) {
+            setModelChoicesError(
+              `Could not load model list: ${reason instanceof Error ? reason.message : String(reason)}`,
+            );
+          }
           const tool = initialParams.get("tool");
           if (tool === "search_full_text" && initialParams.get("query")) {
             await fetchSearchPage(
@@ -390,7 +488,7 @@ function App() {
       .catch((reason: unknown) => {
         if (!active) return;
         setError(reason instanceof Error ? reason.message : String(reason));
-        setStatus("Not connected to :8000");
+        setStatus(`Not connected to ${serverAddress}`);
       });
 
     return () => {
@@ -399,7 +497,7 @@ function App() {
       clientRef.current = null;
       transportRef.current = null;
     };
-  }, []);
+  }, [apiBaseUrl, serverAddress]);
 
   async function fetchSearchPage(offset: number, append: boolean, limit = 10, updateUrl = true) {
     const client = clientRef.current;
@@ -452,6 +550,9 @@ function App() {
     if (!client) return;
     setBusy(true);
     setError("");
+    setChunkView(false);
+    setChunkResult(null);
+    setChunkError("");
     try {
       const response = await client.callTool({
         name: "get_paper_text",
@@ -475,6 +576,175 @@ function App() {
     }
   }
 
+  function closePaper() {
+    setSelected(null);
+    setChunkView(false);
+    setChunkResult(null);
+    const returnUrl = searchUrl
+      ? new URL(searchUrl)
+      : new URL("/", window.location.origin);
+    window.history.pushState(
+      null,
+      "",
+      `${returnUrl.pathname}${returnUrl.search}${returnUrl.hash}`,
+    );
+  }
+
+  async function chunkSelectedPaper() {
+    const client = clientRef.current;
+    if (!client || !selected) return;
+    setChunkBusy(true);
+    setChunkError("");
+    try {
+      const response = await client.callTool({
+        name: "chunk_paper",
+        arguments: {
+          paper_id: selected.paper_id,
+          token_budget: tokenBudget,
+        },
+      });
+      const result = JSON.parse(
+        getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
+      ) as ChunkApiResponse;
+      setChunkResult({
+        ...result,
+        chunks: result.chunks.map((chunk) => ({
+          ...chunk,
+          embeddingStatus: "pending",
+        })),
+      });
+      setEmbeddingProgress({ completed: 0, total: result.chunks.length });
+      setEmbeddingModel("");
+      setChunkView(true);
+    } catch (reason) {
+      setChunkError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setChunkBusy(false);
+    }
+  }
+
+  async function embedPaperChunks() {
+    const client = clientRef.current;
+    if (!client || !chunkResult || embeddingBusy || chunkResult.chunks.length === 0) return;
+
+    const remaining = chunkResult.chunks
+      .map((chunk, index) => ({ chunk, index }))
+      .filter(({ chunk }) => chunk.embeddingStatus !== "done");
+    if (remaining.length === 0) return;
+
+    const completedInitially = chunkResult.chunks.length - remaining.length;
+    setEmbeddingBusy(true);
+    setChunkError("");
+    setEmbeddingProgress({ completed: completedInitially, total: chunkResult.chunks.length });
+
+    let completed = completedInitially;
+    let failed = 0;
+    let succeeded = 0;
+    let finalizeError = "";
+    for (let start = 0; start < remaining.length; start += 4) {
+      const batch = remaining.slice(start, start + 4);
+      const batchIndices = new Set(batch.map(({ index }) => index));
+      setChunkResult((current) => current && ({
+        ...current,
+        chunks: current.chunks.map((chunk, index) =>
+          batchIndices.has(index)
+            ? { ...chunk, embeddingStatus: "embedding", embeddingError: undefined }
+            : chunk,
+        ),
+      }));
+      try {
+        const response = await client.callTool({
+          name: "embed_chunk_batch",
+          arguments: {
+            chunk_table: chunkResult.chunk_table,
+            chunk_ids: batch.map(({ chunk }) => chunk.chunk_id),
+            model: selectedEmbeddingModel,
+          },
+        });
+        const result = JSON.parse(
+          getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
+        ) as EmbeddingResponse;
+        if (result.count !== batch.length || !result.model) {
+          throw new Error("Embedding service returned incomplete batch metadata");
+        }
+        setEmbeddingModel(result.model);
+        succeeded += batch.length;
+        setChunkResult((current) => current && ({
+          ...current,
+          chunks: current.chunks.map((chunk, index) =>
+            batchIndices.has(index) ? { ...chunk, embeddingStatus: "done" } : chunk,
+          ),
+        }));
+      } catch (reason) {
+        failed += batch.length;
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setChunkResult((current) => current && ({
+          ...current,
+          chunks: current.chunks.map((chunk, index) =>
+            batchIndices.has(index)
+              ? { ...chunk, embeddingStatus: "failed", embeddingError: message }
+              : chunk,
+          ),
+        }));
+      }
+      completed += batch.length;
+      setEmbeddingProgress({ completed, total: chunkResult.chunks.length });
+    }
+
+    if (succeeded > 0) {
+      try {
+        const response = await client.callTool({
+          name: "finalize_chunk_embeddings",
+          arguments: {
+            chunk_table: chunkResult.chunk_table,
+            model: selectedEmbeddingModel,
+          },
+        });
+        getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean });
+      } catch (reason) {
+        finalizeError = reason instanceof Error ? reason.message : String(reason);
+      }
+    }
+
+    if (failed > 0) {
+      setChunkError(
+        `${failed} chunk${failed === 1 ? "" : "s"} failed to embed. Failed chunks can be retried.` +
+          (finalizeError ? ` Vector index error: ${finalizeError}` : ""),
+      );
+    } else if (finalizeError) {
+      setChunkError(`Embeddings were saved, but the vector index could not be created: ${finalizeError}`);
+    }
+    setEmbeddingBusy(false);
+  }
+
+  async function testQueryPipeline() {
+    const client = clientRef.current;
+    if (!client || !selected || !chunkResult || !rerankQuery.trim() || queryPipelineBusy) return;
+
+    setQueryPipelineBusy(true);
+    setChunkError("");
+    setQueryPipelineResult(null);
+    try {
+      const response = await client.callTool({
+        name: "search_hybrid_chunks",
+        arguments: {
+          chunk_table: chunkResult?.chunk_table,
+          query: rerankQuery.trim(),
+          embedding_model: selectedEmbeddingModel,
+          reranker_model: selectedRerankerModel || undefined,
+          candidate_limit: 30,
+        },
+      });
+      setQueryPipelineResult(JSON.parse(
+        getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
+      ) as QueryPipelineResponse);
+    } catch (reason) {
+      setChunkError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setQueryPipelineBusy(false);
+    }
+  }
+
   return (
     <main className="page">
       <header className="topbar">
@@ -484,6 +754,8 @@ function App() {
         <span className="connection"><i />{status}</span>
       </header>
 
+      {!selected && (
+        <>
       <section className="hero">
         <h1>Full-text search</h1>
         <form className="search-form" onSubmit={search}>
@@ -529,7 +801,7 @@ function App() {
         <div className="results-grid">
           <div className="result-list">
             {hits.map((hit, index) => (
-              <article className={`paper-card ${selected?.paper_id === hit.paper_id ? "selected" : ""}`} key={hit.paper_id}>
+              <article className="paper-card" key={hit.paper_id}>
                 <div className="card-topline">
                   <span className="result-number">{index + 1}.</span>
                   <button className="paper-id" onClick={() => void openPaper(hit.paper_id)}>{hit.paper_id} ↗</button>
@@ -573,15 +845,18 @@ function App() {
           </div>
         </div>
       </section>
-      <footer className="footer">A local research tool · Search results are limited to the data currently indexed</footer>
+        </>
+      )}
       {selected && (
-          <section className="paper-reader" aria-labelledby="reader-title">
+        <section className="paper-reader" aria-labelledby="reader-title">
             <div className="reader-header">
               <div>
                 <span className="eyebrow">{renderLatex ? "PAPER · " : "PAPER SOURCE · "}{selected.paper_id}</span>
                 <h2 id="reader-title">{selected.metadata?.title || selected.paper_id}</h2>
               </div>
-              <button className="close-reader" onClick={() => setSelected(null)} aria-label="Close paper text">×</button>
+              <button className="back-to-results" onClick={closePaper}>
+                ← {hits.length ? "Back to results" : "Back to search"}
+              </button>
             </div>
             <div className="reader-meta">
               {selected.metadata?.authors && <span>{selected.metadata.authors}</span>}
@@ -598,14 +873,204 @@ function App() {
                 <a href={selected.metadata.license} target="_blank" rel="noreferrer">License</a>
               )}
             </div>
-            <PaperRenderer source={selected.text} renderLatex={renderLatex} />
+            <div className="chunk-actions">
+              <label className="model-select-label">
+                Embedding model
+                <select
+                  value={selectedEmbeddingModel}
+                  onChange={(event) => {
+                    setSelectedEmbeddingModel(event.target.value);
+                    setEmbeddingModel("");
+                    setEmbeddingProgress({ completed: 0, total: chunkResult?.chunks.length ?? 0 });
+                    setChunkResult((current) => current && ({
+                      ...current,
+                      chunks: current.chunks.map((chunk) => ({
+                        ...chunk,
+                        embeddingStatus: "pending",
+                        embeddingError: undefined,
+                      })),
+                    }));
+                    setQueryPipelineResult(null);
+                  }}
+                  disabled={!modelChoices.embedding.length || embeddingBusy || queryPipelineBusy}
+                >
+                  {!modelChoices.embedding.length && <option value="">No embedding models available</option>}
+                  {modelChoices.embedding.map((model) => (
+                    <option key={model.id} value={model.id}>{model.id}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="model-select-label">
+                Reranker model
+                <select
+                  value={selectedRerankerModel}
+                  onChange={(event) => setSelectedRerankerModel(event.target.value)}
+                  disabled={!modelChoices.reranking.length || embeddingBusy || queryPipelineBusy}
+                >
+                  {!modelChoices.reranking.length && <option value="">No tagged reranker models</option>}
+                  {modelChoices.reranking.map((model) => (
+                    <option key={model.id} value={model.id}>{model.id}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="chunk-budget-label">
+                Estimated tokens
+                <input
+                  type="number"
+                  min={1}
+                  max={2048}
+                  step={64}
+                  value={tokenBudget}
+                  onChange={(event) => setTokenBudget(Number(event.target.value))}
+                />
+              </label>
+              <button
+                className="chunk-button"
+                onClick={() => void chunkSelectedPaper()}
+                disabled={chunkBusy || embeddingBusy || tokenBudget < 1 || tokenBudget > 2048}
+              >
+                {chunkBusy ? "Chunking…" : chunkResult ? "Re-chunk paper" : "Chunk paper"}
+              </button>
+              <button
+                className="chunk-button"
+                onClick={() => void embedPaperChunks()}
+                disabled={
+                  chunkBusy ||
+                  embeddingBusy ||
+                  !selectedEmbeddingModel ||
+                  !chunkResult ||
+                  chunkResult.chunks.length === 0 ||
+                  chunkResult.chunks.every((chunk) => chunk.embeddingStatus === "done")
+                }
+              >
+                {embeddingBusy ? "Embedding…" : "Embed chunks"}
+              </button>
+              {chunkView && (
+                <button className="chunk-button secondary" onClick={() => setChunkView(false)}>
+                  Show paper
+                </button>
+              )}
+              {chunkResult && !chunkView && (
+                <button className="chunk-button secondary" onClick={() => setChunkView(true)}>
+                  Show chunks
+                </button>
+              )}
+            </div>
+            <div className="query-pipeline-controls">
+              <label className="chunk-query-label">
+                Test hybrid retrieval
+                <input
+                  className="chunk-query"
+                  value={rerankQuery}
+                  onChange={(event) => setRerankQuery(event.target.value)}
+                  placeholder="Enter a query to test lexical + vector retrieval"
+                  maxLength={2000}
+                />
+              </label>
+              <button
+                className="chunk-button"
+                onClick={() => void testQueryPipeline()}
+                disabled={
+                  queryPipelineBusy ||
+                  !rerankQuery.trim() ||
+                  !selectedEmbeddingModel ||
+                  !chunkResult ||
+                  chunkResult.chunks.every((chunk) => chunk.embeddingStatus !== "done")
+                }
+              >
+                {queryPipelineBusy ? "Searching and reranking…" : "Test hybrid search"}
+              </button>
+            </div>
+            {modelChoicesError && <div className="error-box">{modelChoicesError}</div>}
+            {queryPipelineResult && (
+              <section className="query-pipeline-results" aria-label="Query embedding and reranking results">
+                <div className="chunk-summary">
+                  <strong>Top {queryPipelineResult.hits.length} fused candidates</strong>
+                  <span>
+                    Embedding: {queryPipelineResult.embedding_model}
+                    {" · "}Reranker: {queryPipelineResult.reranker_model ?? "not configured"}
+                  </span>
+                </div>
+                <div className="chunk-list">
+                  {queryPipelineResult.hits.map((hit, index) => (
+                    <article className="chunk-card" key={hit.chunk_id}>
+                      <div className="chunk-card-heading">
+                        <strong>Rank {index + 1} · fused {hit.fused_score.toFixed(5)}</strong>
+                        <span>
+                          {hit.lexical_rank !== null && `lexical #${hit.lexical_rank}`}
+                          {hit.semantic_rank !== null && ` · dense #${hit.semantic_rank}`}
+                          {hit.rerank_score !== null &&
+                            ` · rerank ${
+                              Math.abs(hit.rerank_score) < 0.0001
+                                ? hit.rerank_score.toExponential(2)
+                                : hit.rerank_score.toFixed(4)
+                            }`}
+                        </span>
+                      </div>
+                      <pre>{hit.text}</pre>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            )}
+            {embeddingProgress.total > 0 && (embeddingBusy || embeddingProgress.completed > 0) && (
+              <div className="embedding-progress">
+                <progress
+                  aria-label="Chunk embedding progress"
+                  max={embeddingProgress.total}
+                  value={embeddingProgress.completed}
+                />
+                <span>
+                  {embeddingProgress.completed} / {embeddingProgress.total} chunks processed
+                  {embeddingModel && ` · ${embeddingModel}`}
+                </span>
+              </div>
+            )}
+            {chunkError && <div className="error-box">{chunkError}</div>}
+            {chunkView && chunkResult && (
+              <section className="chunk-view" aria-label="Paper chunk preview">
+                <div className="chunk-summary">
+                  <strong>{chunkResult.chunks.length} chunks · {chunkResult.source_chars.toLocaleString()} source characters</strong>
+                  {embeddingModel && <span>Embedding: {embeddingModel}</span>}
+                </div>
+                {chunkResult.source_truncated && (
+                  <p className="truncation-note">Only the first 1,000,000 characters were chunked.</p>
+                )}
+                <div className="chunk-list">
+                  {chunkResult.chunks.map((chunk, index) => (
+                    <article
+                      className={`chunk-card status-${chunk.embeddingStatus}`}
+                      key={`${chunk.byte_range[0]}-${chunk.byte_range[1]}`}
+                    >
+                      <div className="chunk-card-heading">
+                        <strong>Chunk {index + 1}</strong>
+                        <span>
+                          {chunk.cost} estimated tokens · {chunk.word_count} words
+                          {" · "}bytes {chunk.byte_range[0].toLocaleString()}–{chunk.byte_range[1].toLocaleString()}
+                        </span>
+                      </div>
+                      <div className={`chunk-embedding-status ${chunk.embeddingStatus}`}>
+                        {chunk.embeddingStatus === "pending" && "Not embedded"}
+                        {chunk.embeddingStatus === "embedding" && "Embedding…"}
+                        {chunk.embeddingStatus === "done" && "Done"}
+                        {chunk.embeddingStatus === "failed" && "Failed"}
+                        {chunk.embeddingError && ` · ${chunk.embeddingError}`}
+                      </div>
+                      <pre>{chunk.text}</pre>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            )}
+            {!chunkView && <PaperRenderer source={selected.text} renderLatex={renderLatex} />}
             {selected.truncated && (
               <p className="truncation-note">
                 This paper exceeds the 1,000,000-character reader limit; showing the first {selected.returned_chars.toLocaleString()} characters.
               </p>
             )}
-          </section>
+        </section>
       )}
+      <footer className="footer">A local research tool · Search results are limited to the data currently indexed</footer>
     </main>
   );
 }

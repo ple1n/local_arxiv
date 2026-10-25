@@ -86,9 +86,37 @@ button { cursor: pointer; }
 .reader-header { min-height: 50px; display: flex; justify-content: space-between; align-items: center; gap: 15px; border-bottom: 1px solid var(--line); }
 .reader-header h2 { margin: 0; overflow: hidden; font-size: 15px; line-height: 1.35; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
 .eyebrow { display: block; margin-bottom: 2px; color: var(--muted); font-size: 10px; }
-.close-reader { flex: 0 0 34px; width: 34px; height: 34px; border: 1px solid #888; border-radius: 3px; color: #111; background: #fff; font-size: 22px; line-height: 1; }
+.back-to-results { padding: 7px 10px; border: 1px solid #888; border-radius: 3px; color: #111; background: #fff; font-size: 12px; white-space: nowrap; }
+.back-to-results:hover { background: #f4f8f6; }
 .reader-meta { display: flex; flex-wrap: wrap; gap: 3px 12px; padding: 5px 0; color: var(--muted); font-size: 11px; }
 .reader-meta a { color: var(--accent); }
+.chunk-actions { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin: 8px 0; color: var(--muted); font-size: 11px; }
+.query-pipeline-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; margin: 14px 0 8px; padding: 10px; border: 1px solid #ddd; background: #fafafa; color: var(--muted); font-size: 11px; }
+.chunk-query-label, .chunk-budget-label, .model-select-label { display: grid; gap: 4px; font-weight: 600; }
+.chunk-query { width: min(420px, 70vw); height: 34px; padding: 0 9px; border: 1px solid #999; border-radius: 3px; font-size: 12px; }
+.model-select-label select { width: min(290px, 70vw); height: 34px; padding: 0 7px; border: 1px solid #999; border-radius: 3px; background: #fff; font-size: 12px; }
+.chunk-budget-label input { width: 100px; height: 34px; padding: 0 7px; border: 1px solid #999; border-radius: 3px; font-size: 12px; }
+.chunk-button { padding: 7px 11px; border: 1px solid var(--accent); border-radius: 3px; color: var(--accent); background: #fff; font-size: 12px; font-weight: 600; }
+.chunk-button.secondary { border-color: #888; color: #444; }
+.chunk-button:hover { background: #f4f8f6; }
+.chunk-button:disabled { opacity: .55; cursor: default; }
+.embedding-progress { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 8px 0; color: var(--muted); font-size: 11px; }
+.embedding-progress progress { width: min(320px, 100%); height: 10px; accent-color: var(--accent); }
+.chunk-view { margin: 10px 0 24px; }
+.chunk-summary { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 12px; margin-bottom: 8px; padding: 10px 12px; border: 1px solid #b8d1c4; background: #f3f8f5; color: #315f4d; font-size: 12px; }
+.chunk-list { display: grid; gap: 10px; }
+.chunk-card { min-width: 0; overflow: hidden; border: 1px solid #d3ded8; border-left: 4px solid var(--accent); border-radius: 3px; background: #fff; }
+.chunk-card.status-pending { border-left-color: #aaa; background: #fff; }
+.chunk-card.status-embedding { border-left-color: #b88a36; background: #fffaf0; }
+.chunk-card.status-done { border-left-color: var(--accent); background: #f0f7f3; }
+.chunk-card.status-failed { border-left-color: #b44; background: #fff7f7; }
+.chunk-card-heading { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 10px; padding: 8px 10px; border-bottom: 1px solid #e5e5e5; color: var(--muted); font-size: 11px; }
+.chunk-card-heading strong { color: #222; }
+.chunk-embedding-status { padding: 5px 10px 0; color: var(--muted); font-size: 11px; }
+.chunk-embedding-status.embedding { color: #8a6b3f; }
+.chunk-embedding-status.done { color: #315f4d; font-weight: 600; }
+.chunk-embedding-status.failed { color: #a22; font-weight: 600; }
+.chunk-card pre { margin: 0; padding: 10px; color: #222; font: 12px/1.55 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .latex-frame { display: block; width: 100%; min-height: 100vh; border: 1px solid var(--line); background: #fff; }
 .paper-source { margin: 12px 0 0; padding: 12px; border: 1px solid var(--line); background: #f7f7f7; color: #111; font: 12px/1.5 ui-monospace, monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
 .render-fallback { margin-top: 12px; }

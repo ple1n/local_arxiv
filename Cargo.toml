@@ -14,3 +14,5 @@ rmcp = { version = "3.5.1", features = ["server", "transport-streamable-http-ser
 axum = "0.8"
 serde = { version = "1.0.229", features = ["derive"] }
 tower-http = { version = "0.7.1", features = ["cors", "fs"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+tokenizers = "0.23.2"

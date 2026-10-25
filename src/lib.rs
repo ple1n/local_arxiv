@@ -2,8 +2,11 @@ use parquet2::read::read_metadata;
 use serde_json::{Value, json};
 use std::{fs, fs::File, path::Path};
 
-pub mod mcp_server;
+pub mod chunking;
+pub mod hybrid_pipeline;
 pub mod ingest;
+pub mod mcp_server;
+pub mod test_pipeline;
 
 pub fn inspect_parquet(path: &Path) -> Result<Value, Box<dyn std::error::Error>> {
     let mut file = File::open(path)?;

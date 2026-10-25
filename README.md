@@ -14,9 +14,9 @@ npm --prefix web run build
 ./backend.sh
 ```
 
-Open the React search UI at `http://127.0.0.1:8000/`. The MCP endpoint is
-`http://127.0.0.1:8000/mcp`; the health check is
-`http://127.0.0.1:8000/health`. The UI uses the official MCP TypeScript client
+Open the React search UI at `http://127.0.0.1:8250/`. The MCP endpoint is
+`http://127.0.0.1:8250/mcp`; the health check is
+`http://127.0.0.1:8250/health`. The UI uses the official MCP TypeScript client
 and calls only MCP tools for status, search, and paper retrieval; it does not
 call LanceDB or a parallel REST API. The Vite dev server proxies `/mcp` to the
 Rust process.
@@ -28,8 +28,8 @@ terminal, then run in another:
 ./frontend.sh
 ```
 
-Open `http://127.0.0.1:5173/`. The frontend always connects directly to
-`http://127.0.0.1:8000/mcp`, regardless of its own origin. The Rust server must
+Open `http://127.0.0.1:5173/`. The frontend connects to the configured MCP URL,
+regardless of its own origin. The Rust server must
 be running because it owns the LanceDB connection and MCP tools. Its CORS
 policy permits requests from any origin so local frontend launches can connect
 without an origin allowlist.
@@ -38,15 +38,27 @@ The process opens the database/tables once at startup and retains the LanceDB
 connections for the server lifetime. VS Code connects to the MCP endpoint but
 does not start or manage the server process.
 
-Environment variables:
+Runtime settings are read from the root [`config.json`](./config.json):
 
-- `ARXIV_LANCE_DB`: local LanceDB directory (default `./data/arxiv_lance`)
-- `ARXIV_LANCE_TABLE`: table to query (default `arxiv_full_text`)
-- `ARXIV_METADATA_TABLE`: metadata table (default `arxiv_metadata`)
-- `MCP_ADDR`: bind address (default `127.0.0.1:8000`)
+- `backend.host` and `backend.port`: Rust server listen address
+- `frontend.host` and `frontend.port`: Vite dev-server listen address
+- `embedding.host` and `embedding.port`: optional Python embedding-service
+  listen address
+- `llama.host` and `llama.port`: existing llama-server API address, used for
+  LFM embeddings and Qwen reranking
+- `models.embedding`: configured LFM model ID, user-managed GGUF path,
+  Hugging Face tokenizer repo/path, and model token limit
+- `apiBaseUrl`: complete MCP endpoint URL used by the frontend
 
-The default bind address is loopback-only. Choose an explicit secure deployment
-and access-control layer before binding to a non-loopback interface.
+The backend serves this runtime config to the built frontend; Vite serves the
+same root config during development. Restart the relevant process after editing
+the file. Keep the backend on loopback unless you have an explicit secure
+deployment and access-control layer.
+
+The database path and table names remain backend environment settings:
+`ARXIV_LANCE_DB` (default `./data/arxiv_lance`), `ARXIV_LANCE_TABLE`
+(default `arxiv_full_text`), and `ARXIV_METADATA_TABLE` (default
+`arxiv_metadata`).
 
 ## Tools
 
@@ -62,7 +74,40 @@ and access-control layer before binding to a non-loopback interface.
 - `get_paper_text(paper_id, max_chars?)`: return stored paper text, capped at
   12,000 characters per call by default and at most, along with available
   metadata.
+- `test_paper_chunks(paper_id, query, candidate_limit?)`: search a paper's
+  retained test chunk table through the same hybrid retrieval pipeline used by
+  the `search_hybrid_chunks` tool.
+- `search_hybrid_chunks(chunk_table, query, embedding_model, reranker_model?,
+  candidate_limit?)`: run lexical and dense retrieval against a named chunk
+  table, fuse the ranked candidates with reciprocal rank fusion, then optionally
+  rerank them.
+- `embed_chunk_batch(chunk_table, chunk_ids, model)`: embed and persist up to 8
+  chunks in the selected model's vector column.
+- `finalize_chunk_embeddings(chunk_table, model)`: create the model-specific
+  cosine vector index after embedding batches finish.
+- `embed_texts(texts)`: embed 1 to 8 document passages with the configured LFM
+  model through llama-server and return the model and vector dimensions.
 - `dataset_status()`: report the configured table and its row count.
+
+In the paper reader, **Chunk paper** replaces that paper's retained
+`tmp_test_chunks_*` table with stable chunk IDs, text, and source byte offsets,
+then builds its FTS index. **Embed chunks** writes each batch into a
+model-specific fixed-size vector column and displays per-chunk progress. The
+selected model's vector index is built after the batches complete. Re-chunking
+replaces that test table; changing embedding models adds another vector column
+without overwriting the existing model's vectors.
+
+The query button uses LanceDB BM25 full-text search and vector search over that
+same table, fuses the two ranked lists with RRF (constant 60), and optionally
+reranks the fused candidates. The per-paper table is a small integration path
+through the same `HybridPipeline` chunk-write, embedding-write, index, and
+search methods intended for a corpus chunk table. Corpus callers can provide
+their own table name and call `upsert_paper_text` followed by
+`embed_paper_chunks` to process bounded batches through those same chunking,
+persistence, model-column, and index methods. The test-only
+`replace_paper_text` operation replaces its per-paper table. No full-corpus
+chunking or embedding import has been started; the existing paper-text search
+remains separate and lexical-only until such an import is requested.
 
 The text and metadata live in separate LanceDB tables with native columns,
 linked by `paper_id`. Full-text search is indexed on `text`; the metadata table
@@ -101,3 +146,33 @@ counts and unique `paper_id` counts before building indexes.
 The workspace `.vscode/mcp.json` registers the local HTTP endpoint with VS Code.
 Start the server separately; leaving it running keeps the same database/table
 connection alive across chat sessions.
+
+## LFM embeddings and reranking
+
+The Rust backend sends LFM embedding requests to the existing llama-server
+configured by `llama.host` and `llama.port`. It adds the model's `query: ` or
+`document: ` prompt, tokenizes locally with the configured `tokenizer.json`,
+truncates from the right, then sends text to llama-server's
+`/v1/embeddings` endpoint. The effective input limit is the smaller of the
+requested `ctx` and `models.embedding.maxTokens` (512 by default). Embeddings
+are normalized in Rust. Qwen reranking remains on llama-server's `/rerank`
+endpoint.
+
+The GGUF and tokenizer are user-managed; the Rust backend does not download
+model files. Their paths and the tokenizer's Hugging Face repo are in
+`models.embedding`. If the tokenizer file is missing, startup reports a manual
+`hf download` command. For the default configuration, that command is:
+
+```sh
+hf download LiquidAI/LFM2.5-Embedding-350M tokenizer.json \
+  --local-dir /b/models/LFM2.5-Embedding-350M
+```
+
+`embedding_server.py` is a separate optional Python service and is not used by
+the Rust embedding or reranking pipeline. Do not start it for the LFM setup.
+The `embedding` config entry only remains for that standalone service. The
+chunk-test `ctx` argument defaults to 32K, but local LFM tokenization caps each
+input at the configured model maximum. `list_models` exposes the configured
+LFM embedding model and discovers reranking models from llama-server; set
+`MODEL_LIST_URL` only when the `/v1/models` endpoint is hosted elsewhere.
+`RERANK_API_KEY` can provide bearer authentication when required.
