@@ -53,7 +53,7 @@ button { cursor: pointer; }
   font-size: 14px;
 }
 .search-form button:disabled { opacity: .55; cursor: default; }
-.search-note { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-top: 6px; color: var(--muted); font-size: 11px; }
+.search-note { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 12px; margin-top: 6px; color: var(--muted); font-size: 11px; }
 .render-toggle { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .render-toggle input { margin: 0; }
 .results-section { min-height: 220px; padding-bottom: 20px; }

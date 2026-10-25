@@ -74,8 +74,11 @@ The database path and table names remain backend environment settings:
 - `get_paper_text(paper_id, max_chars?)`: return stored paper text, capped at
   12,000 characters per call by default and at most, along with available
   metadata.
-- `start_indexing_job(paper_id?, token_budget?)`: queue either one paper or all
-  papers still pending chunking/embedding. The backend owns the job and streams
+- `start_indexing_job(paper_id?, token_budget?, mode?)`: queue either one paper or all
+  papers still pending embedding. `mode` is `abstract` (the default) or
+  `full_text`. Full-text mode retains the existing chunking and persistent
+  chunk-state behavior. Abstract mode embeds the metadata abstract directly.
+  The backend owns the job and streams
   progress at `/indexing-jobs/{job_id}/events`, including papers per second,
   elapsed time, estimated time remaining, current paper, and processing phase.
   The web UI can pause and resume a job; pausing waits for the in-flight
@@ -87,10 +90,13 @@ The database path and table names remain backend environment settings:
   hybrid retrieval pipeline.
 - `chunk_paper(paper_id, token_budget?)`: preview chunk boundaries without
   writing chunks or starting embedding.
-- `search_hybrid_chunks(chunk_table, query, embedding_model, reranker_model?,
-  candidate_limit?)`: run lexical and dense retrieval against a named chunk
-  table, fuse the ranked candidates with reciprocal rank fusion, then optionally
-  rerank them.
+- `search_hybrid_chunks(chunk_table, query, embedding_model, mode?,
+  reranker_model?, candidate_limit?)`: run lexical and dense retrieval using
+  either the named chunk table (`full_text`) or full-paper BM25 search plus
+  abstract vectors (`abstract`, the default). Abstract mode does not require
+  full-text chunks or chunk vectors. Abstract-mode
+  candidates are fused with full-text lexical results by `paper_id`, then can
+  optionally be reranked.
 - `embed_chunk_batch(chunk_table, chunk_ids, model)`: embed and persist up to 8
   chunks in the selected model's vector column.
 - `finalize_chunk_embeddings(chunk_table, model)`: create the model-specific
@@ -100,10 +106,16 @@ The database path and table names remain backend environment settings:
 - `dataset_status()`: report the configured table and its row count.
 
 The paper reader's **Chunk paper** action previews chunk boundaries.
-**Embed chunks** queues a backend job; the browser subscribes to its progress
-stream and does not issue embedding batches itself. **Index pending papers**
-queues all papers not marked chunked and embedded in the main text table. Both
-paths use the same per-paper worker and global `arxiv_chunks` table.
+The **index** button queues a backend job; the browser subscribes to its progress
+stream and does not issue embedding batches itself. The main **index** button
+queues pending papers according to the selected embedding mode; the reader's
+**index** button queues the selected paper. Abstract-only mode is selected by
+default. Full-text mode indexes
+papers not marked chunked and embedded in the main text table. Abstract mode
+uses null vectors in `arxiv_abstracts` as the pending-work marker, with one row
+per paper and no chunk/status fields. The Web UI's **Embedding mode** selector
+controls both indexing and hybrid dense search; changing modes never changes
+the full-text BM25 search path.
 
 The main text table stores nullable `chunked` and `embedded` flags, model ID,
 chunk counts, and the latest indexing error. Boolean bitmap indexes support
@@ -115,8 +127,11 @@ Batch embedding failures are retried per chunk so one bad passage does not mark
 its whole batch as failed. The vector index is finalized after the job.
 
 The query button uses LanceDB BM25 full-text search and vector search over the
-global chunk table, fuses the two ranked lists with RRF (constant 60), and
-optionally reranks the fused candidates. The one-paper test and corpus job share
+global chunk table in full-text mode, fusing the two ranked lists with RRF
+(constant 60). In abstract mode, the same full-text BM25 results are fused by
+`paper_id` with dense results from `arxiv_abstracts`, also using RRF 60. Abstract
+mode uses the main paper-text BM25 index, without requiring chunk indexing. Both
+paths optionally rerank the fused candidates. The one-paper test and corpus job share
 the same durable state transitions, chunk table, embedding adapter, and index
 finalization path. Full-corpus indexing is started explicitly from the UI; it
 does not begin automatically on server startup.
@@ -124,7 +139,11 @@ does not begin automatically on server startup.
 The text and metadata live in separate LanceDB tables with native columns,
 linked by `paper_id`. Full-text search is indexed on `text`; the metadata table
 has a B-tree index on `paper_id`. Metadata is looked up by ID and added to the
-MCP response; it is not concatenated into a stored blob.
+MCP response; it is not concatenated into a stored blob. Abstract vectors use a
+separate `arxiv_abstracts` table with `paper_id`, `abstract`, and nullable
+model-specific vector columns. It is initialized from metadata on first use;
+null vector values mean pending, and indexing progress is derived from vector
+presence rather than extra status fields.
 
 The MCP tools only see data already present in the selected LanceDB tables.
 Sample-scale and full-corpus ingestion use the same table names and shared

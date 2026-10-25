@@ -103,6 +103,8 @@ type ModelChoices = {
   reranking: AvailableModel[];
 };
 
+type EmbeddingMode = "full_text" | "abstract";
+
 type QueryPipelineResponse = {
   embedding_model: string;
   reranker_model: string | null;
@@ -446,6 +448,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [modelChoicesError, setModelChoicesError] = useState("");
   const [selectedEmbeddingModel, setSelectedEmbeddingModel] = useState("");
   const [selectedRerankerModel, setSelectedRerankerModel] = useState("");
+  const [embeddingMode, setEmbeddingMode] = useState<EmbeddingMode>("abstract");
   const [tokenBudget, setTokenBudget] = useState(480);
 
   useEffect(() => {
@@ -666,8 +669,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       const response = await client.callTool({
         name: "start_indexing_job",
         arguments: paperId
-          ? { paper_id: paperId, token_budget: tokenBudget }
-          : {},
+          ? { paper_id: paperId, token_budget: tokenBudget, mode: embeddingMode }
+          : { mode: embeddingMode },
       });
       const job = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
@@ -681,7 +684,12 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
           events.close();
           if (jobEventSourceRef.current === events) jobEventSourceRef.current = null;
           setEmbeddingBusy(false);
-          if (paperId && progress.embedded_papers > 0 && progress.failed_papers === 0) {
+          if (
+            paperId &&
+            embeddingMode === "full_text" &&
+            progress.embedded_papers > 0 &&
+            progress.failed_papers === 0
+          ) {
             setEmbeddingModel(selectedEmbeddingModel);
             setChunkResult((current) => current && ({
               ...current,
@@ -736,15 +744,28 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
     await startIndexingJob(selected.paper_id);
   }
 
+  async function indexSelectedPaper() {
+    if (!selected) return;
+    if (embeddingMode === "full_text") {
+      await embedPaperChunks();
+    } else {
+      await startIndexingJob(selected.paper_id);
+    }
+  }
+
   async function startFullIndexingJob() {
-    if (window.confirm("Queue every paper that is not fully chunked and embedded? This may run for a long time.")) {
+    const target = embeddingMode === "abstract"
+      ? "Queue every paper whose abstract has no vector?"
+      : "Queue every paper that is not fully chunked and embedded?";
+    if (window.confirm(`${target} This may run for a long time.`)) {
       await startIndexingJob();
     }
   }
 
   async function testQueryPipeline() {
     const client = clientRef.current;
-    if (!client || !selected || !chunkResult || !rerankQuery.trim() || queryPipelineBusy) return;
+    if (!client || !selected || !rerankQuery.trim() || queryPipelineBusy) return;
+    if (embeddingMode === "full_text" && !chunkResult) return;
 
     setQueryPipelineBusy(true);
     setChunkError("");
@@ -753,9 +774,10 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       const response = await client.callTool({
         name: "search_hybrid_chunks",
         arguments: {
-          chunk_table: chunkResult?.chunk_table,
+          chunk_table: chunkResult?.chunk_table ?? "arxiv_chunks",
           query: rerankQuery.trim(),
           embedding_model: selectedEmbeddingModel,
+          mode: embeddingMode,
           reranker_model: selectedRerankerModel || undefined,
           candidate_limit: 30,
         },
@@ -833,6 +855,17 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
         </form>
         <div className="search-note">
           <span>Local index · Search results include matching text and metadata</span>
+          <label className="model-select-label">
+            Embedding mode
+            <select
+              value={embeddingMode}
+              onChange={(event) => setEmbeddingMode(event.target.value as EmbeddingMode)}
+              disabled={embeddingBusy || queryPipelineBusy}
+            >
+              <option value="full_text">Full-text chunks</option>
+              <option value="abstract">Abstract only</option>
+            </select>
+          </label>
           <label className="render-toggle">
             <input
               type="checkbox"
@@ -846,7 +879,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             onClick={() => void startFullIndexingJob()}
             disabled={embeddingBusy || !selectedEmbeddingModel}
           >
-            {embeddingBusy ? "Indexing…" : "Index pending papers"}
+            {embeddingBusy ? "Indexing…" : "index"}
           </button>
         </div>
       </section>
@@ -999,17 +1032,18 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
               </button>
               <button
                 className="chunk-button"
-                onClick={() => void embedPaperChunks()}
+                onClick={() => void indexSelectedPaper()}
                 disabled={
                   chunkBusy ||
                   embeddingBusy ||
                   !selectedEmbeddingModel ||
-                  !chunkResult ||
-                  chunkResult.chunks.length === 0 ||
-                  chunkResult.chunks.every((chunk) => chunk.embeddingStatus === "done")
+                  (embeddingMode === "full_text" &&
+                    (!chunkResult ||
+                      chunkResult.chunks.length === 0 ||
+                      chunkResult.chunks.every((chunk) => chunk.embeddingStatus === "done")))
                 }
               >
-                {embeddingBusy ? "Indexing…" : "Index / resume paper"}
+                {embeddingBusy ? "Indexing…" : "index"}
               </button>
               {chunkView && (
                 <button className="chunk-button secondary" onClick={() => setChunkView(false)}>
@@ -1023,6 +1057,17 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
               )}
             </div>
             <div className="query-pipeline-controls">
+              <label className="model-select-label">
+                Embedding mode
+                <select
+                  value={embeddingMode}
+                  onChange={(event) => setEmbeddingMode(event.target.value as EmbeddingMode)}
+                  disabled={embeddingBusy || queryPipelineBusy}
+                >
+                  <option value="full_text">Full-text chunks</option>
+                  <option value="abstract">Abstract only</option>
+                </select>
+              </label>
               <label className="chunk-query-label">
                 Test hybrid retrieval
                 <input
@@ -1040,8 +1085,9 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                   queryPipelineBusy ||
                   !rerankQuery.trim() ||
                   !selectedEmbeddingModel ||
-                  !chunkResult ||
-                  chunkResult.chunks.every((chunk) => chunk.embeddingStatus !== "done")
+                  (embeddingMode === "full_text" &&
+                    (!chunkResult ||
+                      chunkResult.chunks.every((chunk) => chunk.embeddingStatus !== "done")))
                 }
               >
                 {queryPipelineBusy ? "Searching and reranking…" : "Test hybrid search"}

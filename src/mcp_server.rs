@@ -380,6 +380,10 @@ struct HybridChunkSearchArgs {
     query: String,
     #[schemars(description = "Embedding model ID whose model-specific vector column is searched")]
     embedding_model: String,
+    #[schemars(
+        description = "Embedding mode: abstract (default) or full_text; abstract dense results are fused with full-text lexical results by paper_id"
+    )]
+    mode: Option<String>,
     #[schemars(description = "Optional reranking model ID")]
     reranker_model: Option<String>,
     #[schemars(description = "Maximum fused candidates to return; defaults to 30, maximum 100")]
@@ -400,6 +404,8 @@ struct StartIndexJobArgs {
         description = "Tokenizer-measured chunk budget; defaults to 480 and is capped by the safe model limit"
     )]
     token_budget: Option<usize>,
+    #[schemars(description = "Embedding mode: abstract (default) or full_text")]
+    mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -589,8 +595,12 @@ impl ArxivMcpServer {
         &self,
         paper_id: Option<String>,
         token_budget: usize,
+        mode: &str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let database = connect(&self.database_path).execute().await?;
+        if mode == "abstract" {
+            return self.run_abstract_index_job(&database, paper_id).await;
+        }
         let filter = if let Some(paper_id) = &paper_id {
             format!("paper_id = {}", sql_string(paper_id))
         } else {
@@ -716,6 +726,117 @@ impl ArxivMcpServer {
                 },
             );
             pipeline.ensure_vector_index(&self.embedding_model).await?;
+        }
+        Ok(())
+    }
+
+    async fn run_abstract_index_job(
+        &self,
+        database: &lancedb::Connection,
+        paper_id: Option<String>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let table =
+            crate::hybrid_pipeline::ensure_abstract_table(database, &self.metadata_table).await?;
+        let vector_column = crate::hybrid_pipeline::vector_column_name(&self.embedding_model);
+        let has_vector_column = table
+            .schema()
+            .await?
+            .field_with_name(&vector_column)
+            .is_ok();
+        let mut filters = Vec::new();
+        if let Some(id) = &paper_id {
+            filters.push(format!("paper_id = {}", sql_string(id)));
+        } else if has_vector_column {
+            filters.push(format!("{vector_column} IS NULL"));
+        }
+        let filter = (!filters.is_empty()).then(|| filters.join(" AND "));
+        let mut query = table.query();
+        if let Some(filter) = filter {
+            query = query.only_if(filter);
+        }
+        let mut rows = query
+            .select(Select::columns(&["paper_id", "abstract"]))
+            .execute()
+            .await?;
+        let embedder = self.embedder(&self.embedding_model)?;
+        let job_embedder = JobPausableEmbedder {
+            inner: &embedder,
+            jobs: Some(&self.index_jobs),
+        };
+        let mut scanned = 0;
+        let mut embedded_count = 0;
+        let mut failed_count = 0;
+        let mut last_progress_update = Instant::now();
+        while let Some(batch) = rows.next().await {
+            let batch = batch?;
+            for row in 0..batch.num_rows() {
+                self.index_jobs.wait_until_resumed().await;
+                let id = string_at(&batch, "paper_id", row)?
+                    .ok_or("abstract row has a null paper_id")?;
+                self.index_jobs
+                    .update(|progress| {
+                        progress.current_paper = Some(id.clone());
+                        progress.phase = Some("embedding abstract".to_owned());
+                    })
+                    .await;
+                match crate::hybrid_pipeline::embed_abstract_paper(
+                    database,
+                    &id,
+                    &self.embedding_model,
+                    self.embedding_ctx,
+                    &job_embedder,
+                )
+                .await
+                {
+                    Ok(true) => embedded_count += 1,
+                    Ok(false) => {}
+                    Err(error) => {
+                        failed_count += 1;
+                        eprintln!("Abstract embedding failed for {id}: {error}");
+                    }
+                }
+                scanned += 1;
+                if scanned % 100 == 0
+                    || paper_id.is_some()
+                    || last_progress_update.elapsed().as_secs_f64() >= 1.0
+                {
+                    self.index_jobs
+                        .update(|progress| {
+                            progress.scanned_papers = scanned;
+                            progress.chunked_papers = 0;
+                            progress.embedded_papers = embedded_count;
+                            progress.failed_papers = failed_count;
+                            progress.current_paper = Some(id);
+                        })
+                        .await;
+                    last_progress_update = Instant::now();
+                }
+            }
+        }
+        if paper_id.is_some() && scanned == 0 {
+            return Err(format!(
+                "No paper found with paper_id {:?}",
+                paper_id.as_deref().unwrap_or_default()
+            )
+            .into());
+        }
+        self.index_jobs
+            .update(|progress| {
+                progress.scanned_papers = scanned;
+                progress.chunked_papers = 0;
+                progress.embedded_papers = embedded_count;
+                progress.failed_papers = failed_count;
+            })
+            .await;
+        if embedded_count > 0 {
+            crate::hybrid_pipeline::ensure_abstract_vector_index(database, &self.embedding_model)
+                .await?;
+        }
+        if failed_count > 0 {
+            return Err(format!(
+                "{failed_count} abstract embeddings failed; rerun to retry pending rows"
+            )
+            .into());
         }
         Ok(())
     }
@@ -1216,7 +1337,40 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        let total_papers = if paper_id.is_some() {
+        let mode = args.mode.unwrap_or_else(|| "abstract".to_owned());
+        if !matches!(mode.as_str(), "full_text" | "abstract") {
+            return Err(McpError::invalid_params(
+                "mode must be either full_text or abstract",
+                None,
+            ));
+        }
+        let database = connect(&self.database_path)
+            .execute()
+            .await
+            .map_err(internal_error)?;
+        let total_papers = if mode == "abstract" {
+            let abstracts =
+                crate::hybrid_pipeline::ensure_abstract_table(&database, &self.metadata_table)
+                    .await
+                    .map_err(internal_error)?;
+            let vector_column = crate::hybrid_pipeline::vector_column_name(&self.embedding_model);
+            let has_vector_column = abstracts
+                .schema()
+                .await
+                .map_err(internal_error)?
+                .field_with_name(&vector_column)
+                .is_ok();
+            let mut filters = Vec::new();
+            if let Some(id) = &paper_id {
+                filters.push(format!("paper_id = {}", sql_string(id)));
+            } else if has_vector_column {
+                filters.push(format!("{vector_column} IS NULL"));
+            }
+            abstracts
+                .count_rows((!filters.is_empty()).then(|| filters.join(" AND ")))
+                .await
+                .map_err(internal_error)?
+        } else if paper_id.is_some() {
             self.table
                 .count_rows(Some(format!(
                     "paper_id = {}",
@@ -1255,7 +1409,7 @@ impl ArxivMcpServer {
                     heartbeat_jobs.update(|_| {}).await;
                 }
             });
-            match server.run_index_job(paper_id, token_budget).await {
+            match server.run_index_job(paper_id, token_budget, &mode).await {
                 Ok(()) => jobs.finish("complete", None).await,
                 Err(error) => jobs.finish("failed", Some(error.to_string())).await,
             };
@@ -1549,6 +1703,13 @@ impl ArxivMcpServer {
             ));
         }
         let ctx = validate_embedding_ctx(args.ctx.unwrap_or(self.embedding_ctx))?;
+        let mode = args.mode.as_deref().unwrap_or("abstract");
+        if !matches!(mode, "full_text" | "abstract") {
+            return Err(McpError::invalid_params(
+                "mode must be either full_text or abstract",
+                None,
+            ));
+        }
 
         let database = connect(&self.database_path)
             .execute()
@@ -1566,19 +1727,35 @@ impl ArxivMcpServer {
                 chunks: table_name.to_owned(),
             },
         );
-        let results = pipeline
-            .search(
-                query,
-                embedding_model,
-                reranker
-                    .as_ref()
-                    .map(|reranker| reranker as &dyn crate::test_pipeline::Reranker),
-                candidate_limit,
-                ctx,
-                &embedder,
-            )
-            .await
-            .map_err(internal_error)?;
+        let reranker = reranker
+            .as_ref()
+            .map(|reranker| reranker as &dyn crate::test_pipeline::Reranker);
+        let results = if mode == "abstract" {
+            pipeline
+                .search_abstract(
+                    &self.table,
+                    crate::hybrid_pipeline::GLOBAL_ABSTRACT_TABLE,
+                    query,
+                    embedding_model,
+                    reranker,
+                    candidate_limit,
+                    ctx,
+                    &embedder,
+                )
+                .await
+        } else {
+            pipeline
+                .search(
+                    query,
+                    embedding_model,
+                    reranker,
+                    candidate_limit,
+                    ctx,
+                    &embedder,
+                )
+                .await
+        }
+        .map_err(internal_error)?;
         serde_json::to_string(&results).map_err(internal_error)
     }
 
