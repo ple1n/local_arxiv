@@ -939,6 +939,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
           ? { ...current, state: paused ? "paused" : "running" }
           : current,
       );
+      setEmbeddingBusy(!paused);
       const subscription = indexJobSubscriptionRef.current;
       if (
         paused &&
