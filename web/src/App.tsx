@@ -449,7 +449,14 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const lastIndexProgressAtRef = useRef(0);
   const lastIndexProgressRenderAtRef = useRef(0);
   const [query, setQuery] = useState(initialParams.get("query") ?? "");
-  const [embeddedOnly, setEmbeddedOnly] = useState(initialParams.get("embedded_only") === "1");
+  const [lexicalSearch, setLexicalSearch] = useState(
+    initialParams.get("lexical") === null || initialParams.get("lexical") === "1",
+  );
+  const [semanticSearch, setSemanticSearch] = useState(
+    initialParams.get("semantic") === null
+      ? initialParams.get("embedded_only") === "1"
+      : initialParams.get("semantic") === "1",
+  );
   const [searchUrl, setSearchUrl] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [lookupTimeMs, setLookupTimeMs] = useState<number | null>(null);
@@ -568,7 +575,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
           }
           const tool = initialParams.get("tool");
           if ((tool === "search_full_text" && initialParams.get("query")) ||
-            (tool === "search_embedded_papers" && initialParams.get("embedded_only") === "1")) {
+            (tool === "search_embedded_papers" &&
+              (initialParams.get("embedded_only") === "1" || initialParams.get("semantic") === "1"))) {
             await fetchSearchPage(
               Number.parseInt(initialParams.get("offset") ?? "0", 10) || 0,
               false,
@@ -606,18 +614,22 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   async function fetchSearchPage(offset: number, append: boolean, limit = 10, updateUrl = true) {
     const client = clientRef.current;
     const searchQuery = query.trim();
-    if (!client || (!searchQuery && !embeddedOnly)) return;
+    const searchMode = lexicalSearch
+      ? semanticSearch ? "hybrid" : "lexical"
+      : semanticSearch ? "semantic" : null;
+    if (!client || !searchMode || (!searchQuery && !semanticSearch)) return;
 
     setBusy(true);
     setError("");
     setSelected(null);
     try {
       const response = await client.callTool({
-        name: embeddedOnly ? "search_embedded_papers" : "search_full_text",
-        arguments: embeddedOnly
+        name: searchMode === "lexical" ? "search_full_text" : "search_embedded_papers",
+        arguments: searchMode !== "lexical"
           ? {
               query: searchQuery,
               ...(selectedEmbeddingModel ? { embedding_model: selectedEmbeddingModel } : {}),
+              ...(searchMode === "semantic" ? { semantic_only: true } : {}),
               limit,
               offset,
             }
@@ -630,9 +642,12 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       setLookupTimeMs(searchResponse.metadata.lookup_time_ms);
       setNextOffset(searchResponse.metadata.next_offset);
       setHasMore(searchResponse.metadata.has_more);
-      setSearchUrl(new URL(searchResponse.search_url, window.location.origin).toString());
+      const shareUrl = new URL(searchResponse.search_url, window.location.origin);
+      shareUrl.searchParams.set("lexical", lexicalSearch ? "1" : "0");
+      shareUrl.searchParams.set("semantic", semanticSearch ? "1" : "0");
+      setSearchUrl(shareUrl.toString());
       if (updateUrl) {
-        window.history.pushState(null, "", searchResponse.search_url);
+        window.history.pushState(null, "", `${shareUrl.pathname}${shareUrl.search}`);
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -1061,7 +1076,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       {!selected && (
         <>
       <section className="hero">
-        <h1>Full-text search</h1>
+        <h1>Paper search</h1>
         <form className="search-form" onSubmit={search}>
           <input
             aria-label="Search paper text"
@@ -1070,7 +1085,10 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             value={query}
             onChange={(event) => setQuery(event.target.value)}
           />
-          <button type="submit" disabled={busy || (!query.trim() && !embeddedOnly)}>
+          <button
+            type="submit"
+            disabled={busy || (!lexicalSearch && !semanticSearch) || (!query.trim() && !semanticSearch)}
+          >
             {busy ? "Searching…" : "Search"}
             <span aria-hidden="true">↗</span>
           </button>
@@ -1080,10 +1098,22 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
           <label className="render-toggle">
             <input
               type="checkbox"
-              checked={embeddedOnly}
-              onChange={(event) => setEmbeddedOnly(event.target.checked)}
+              checked={lexicalSearch}
+              onChange={(event) => setLexicalSearch(event.target.checked)}
             />
-            Embedded only
+            Lexical
+          </label>
+          <label className="render-toggle">
+            <input
+              type="checkbox"
+              checked={semanticSearch}
+              onChange={(event) => setSemanticSearch(event.target.checked)}
+            />
+            Semantic
+          </label>
+          <label className="render-toggle planned-toggle" title="Reranking is planned and not available yet">
+            <input type="checkbox" disabled checked={false} />
+            Rerank (planned)
           </label>
           <label className="model-select-label">
             Embedding mode
@@ -1135,7 +1165,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                 {abstractIndexBusy ? "Building index…" : "Index not ready"}
               </button>
             )}
-          {embeddedOnly && abstractIndexError && (
+          {semanticSearch && abstractIndexError && (
             <span role="alert">{abstractIndexError}</span>
           )}
         </div>

@@ -385,6 +385,10 @@ struct EmbeddedSearchArgs {
     limit: Option<usize>,
     #[schemars(description = "Number of results to skip")]
     offset: Option<usize>,
+    #[schemars(
+        description = "Use semantic-only abstract-vector search instead of hybrid lexical and semantic search"
+    )]
+    semantic_only: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -1447,7 +1451,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Browse or hybrid-search papers with abstract embeddings for a model. An empty query browses the embedded subset."
+        description = "Browse papers with abstract embeddings, run hybrid lexical+semantic search, or use semantic-only search for a model. An empty query browses the embedded subset."
     )]
     async fn search_embedded_papers(
         &self,
@@ -1470,13 +1474,20 @@ impl ArxivMcpServer {
             .embedding_model
             .as_deref()
             .unwrap_or(&self.embedding_model);
+        let semantic_only = args.semantic_only.unwrap_or(false);
         if model.trim().is_empty() || model.len() > 512 {
             return Err(McpError::invalid_params("embedding_model is invalid", None));
         }
         let ready_column = crate::hybrid_pipeline::embedding_ready_column_name(model);
         eprintln!(
             "[embedded-search] start mode={} model={model:?} query_chars={} offset={offset} limit={limit}",
-            if query.is_empty() { "browse" } else { "hybrid" },
+            if query.is_empty() {
+                "browse"
+            } else if semantic_only {
+                "semantic"
+            } else {
+                "hybrid"
+            },
             query.chars().count()
         );
         self.metadata_table
@@ -1532,8 +1543,9 @@ impl ArxivMcpServer {
             (hits, has_more)
         } else {
             let hybrid_started = Instant::now();
+            let mode = if semantic_only { "semantic" } else { "hybrid" };
             eprintln!(
-                "[embedded-search] hybrid pipeline started candidate_limit={}",
+                "[embedded-search] {mode} pipeline started candidate_limit={}",
                 offset.saturating_add(limit).saturating_add(1).min(100)
             );
             let database = connect(&self.database_path)
@@ -1548,21 +1560,34 @@ impl ArxivMcpServer {
             );
             let embedder = self.embedder(model)?;
             let candidate_limit = offset.saturating_add(limit).saturating_add(1).min(100);
-            let hybrid = pipeline
-                .search_abstract(
-                    &self.table,
-                    &self.metadata_table.name(),
-                    query,
-                    model,
-                    None,
-                    candidate_limit,
-                    self.embedding_ctx,
-                    &embedder,
-                )
-                .await
-                .map_err(internal_error)?;
+            let hybrid = if semantic_only {
+                pipeline
+                    .search_abstract_semantic(
+                        &self.metadata_table.name(),
+                        query,
+                        model,
+                        candidate_limit,
+                        self.embedding_ctx,
+                        &embedder,
+                    )
+                    .await
+            } else {
+                pipeline
+                    .search_abstract(
+                        &self.table,
+                        &self.metadata_table.name(),
+                        query,
+                        model,
+                        None,
+                        candidate_limit,
+                        self.embedding_ctx,
+                        &embedder,
+                    )
+                    .await
+            }
+            .map_err(internal_error)?;
             eprintln!(
-                "[embedded-search] hybrid pipeline complete elapsed_ms={} candidates={}",
+                "[embedded-search] {mode} pipeline complete elapsed_ms={} candidates={}",
                 hybrid_started.elapsed().as_millis(),
                 hybrid.hits.len()
             );

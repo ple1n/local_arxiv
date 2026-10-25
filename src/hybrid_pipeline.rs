@@ -1037,6 +1037,112 @@ impl<'a> HybridPipeline<'a> {
             hits,
         })
     }
+
+    pub async fn search_abstract_semantic(
+        &self,
+        abstract_table_name: &str,
+        query: &str,
+        embedding_model: &str,
+        candidate_limit: usize,
+        ctx: usize,
+        embedder: &dyn Embedder,
+    ) -> PipelineResult<HybridResponse> {
+        if query.trim().is_empty() {
+            return Err("semantic search query must not be empty".into());
+        }
+        if candidate_limit == 0 || candidate_limit > 100 {
+            return Err("candidate limit must be between 1 and 100".into());
+        }
+        if embedder.model_name() != embedding_model {
+            return Err(format!(
+                "selected embedding model {embedding_model:?} does not match embedder {:?}",
+                embedder.model_name()
+            )
+            .into());
+        }
+
+        let abstract_table = self
+            .connection
+            .open_table(abstract_table_name)
+            .execute()
+            .await?;
+        let index_status = abstract_vector_index_status(&abstract_table, embedding_model).await?;
+        if !index_status.vector_index_ready {
+            return Err(format!(
+                "abstract vector index is not ready: {} embedded vectors, {} indexed, {} unindexed",
+                index_status.embedded_vectors,
+                index_status.indexed_vectors,
+                index_status.unindexed_vectors
+            )
+            .into());
+        }
+
+        let query_vectors = embedder
+            .embed(&[query.to_owned()], EmbeddingTask::Query, ctx)
+            .await?;
+        let query_vector = query_vectors
+            .first()
+            .ok_or("embedding service returned no query vector")?;
+        if query_vector.is_empty() || query_vector.iter().any(|value| !value.is_finite()) {
+            return Err("embedding service returned an empty or non-finite query vector".into());
+        }
+
+        let vector_column = vector_column_name(embedding_model);
+        let schema = abstract_table.schema().await?;
+        match schema.field_with_name(&vector_column)?.data_type() {
+            DataType::FixedSizeList(item, size)
+                if *size as usize == query_vector.len()
+                    && item.data_type() == &DataType::Float32 => {}
+            _ => {
+                return Err(format!(
+                    "query vector dimension or type does not match column {vector_column:?}"
+                )
+                .into());
+            }
+        }
+
+        let dense = collect_abstract_ranked(
+            abstract_table
+                .vector_search(query_vector.clone())?
+                .column(&vector_column)
+                .distance_type(DistanceType::Cosine)
+                .select(Select::columns(&["paper_id"]))
+                .limit(candidate_limit)
+                .execute()
+                .await?,
+        )
+        .await?;
+        let paper_ids = dense
+            .iter()
+            .map(|hit| hit.paper_id.as_str())
+            .collect::<Vec<_>>();
+        let abstracts = metadata_abstracts(&abstract_table, &paper_ids).await?;
+        let hits = dense
+            .into_iter()
+            .enumerate()
+            .map(|(rank, hit)| {
+                let text = abstracts
+                    .get(&hit.paper_id)
+                    .cloned()
+                    .ok_or_else(|| format!("metadata missing for {}", hit.paper_id))?;
+                Ok(HybridHit {
+                    chunk_id: hit.paper_id.clone(),
+                    paper_id: hit.paper_id,
+                    text,
+                    lexical_rank: None,
+                    semantic_rank: Some(rank + 1),
+                    fused_score: reciprocal_rank(rank + 1),
+                    rerank_score: None,
+                })
+            })
+            .collect::<PipelineResult<Vec<_>>>()?;
+
+        Ok(HybridResponse {
+            embedding_model: embedding_model.to_owned(),
+            reranker_model: None,
+            hits,
+        })
+    }
 }
 
 pub async fn embed_abstract_batch(
@@ -1906,6 +2012,29 @@ mod tests {
                 .collect::<std::collections::HashSet<_>>()
                 .len(),
             result.hits.len()
+        );
+        let semantic_result = pipeline
+            .search_abstract_semantic(
+                "metadata_test",
+                "relevant",
+                "mock-embedding",
+                10,
+                32_768,
+                &MockEmbedder,
+            )
+            .await?;
+        let semantic_paper_one = semantic_result
+            .hits
+            .iter()
+            .find(|hit| hit.paper_id == "paper-1")
+            .expect("the semantically relevant paper should be returned");
+        assert_eq!(semantic_paper_one.lexical_rank, None);
+        assert_eq!(semantic_paper_one.semantic_rank, Some(1));
+        assert!(
+            semantic_result
+                .hits
+                .iter()
+                .all(|hit| hit.rerank_score.is_none())
         );
         let indexed = abstract_vector_index_status(&metadata, "mock-embedding").await?;
         assert!(indexed.vector_index_ready);

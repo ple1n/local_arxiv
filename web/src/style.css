@@ -56,6 +56,7 @@ button { cursor: pointer; }
 .search-note { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: center; gap: 8px 12px; margin-top: 6px; color: var(--muted); font-size: 11px; }
 .render-toggle { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
 .render-toggle input { margin: 0; }
+.planned-toggle { opacity: .65; }
 .results-section { min-height: 220px; padding-bottom: 20px; }
 .results-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 12px 0; border-bottom: 1px solid var(--line); }
 .results-summary, .results-actions { display: flex; min-width: 0; align-items: center; gap: 10px; }
