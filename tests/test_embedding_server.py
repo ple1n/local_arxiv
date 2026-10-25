@@ -33,6 +33,16 @@ class ProductQuantizationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             embedding_server._suggest_num_sub_vectors(0)
 
+    def test_partition_count_uses_available_vector_count(self):
+        self.assertEqual(embedding_server._suggest_num_partitions(3354), 1)
+        self.assertEqual(embedding_server._suggest_num_partitions(8192), 1)
+        self.assertEqual(embedding_server._suggest_num_partitions(16384), 2)
+        self.assertEqual(embedding_server._suggest_num_partitions(8192 * 5000), 4096)
+
+    def test_nonpositive_vector_count_is_rejected(self):
+        with self.assertRaises(ValueError):
+            embedding_server._suggest_num_partitions(0)
+
 
 class IndexJobRequestTests(unittest.TestCase):
     def setUp(self):

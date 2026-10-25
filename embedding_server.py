@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -75,6 +76,12 @@ def _suggest_num_sub_vectors(dimension: int) -> int:
     return 1
 
 
+def _suggest_num_partitions(vector_count: int) -> int:
+    if vector_count <= 0:
+        raise ValueError(f"Vector count must be positive, got {vector_count}")
+    return min(max(1, vector_count // 8192), 4096)
+
+
 def _run_index_job(
     job_id: str,
     database_path: str,
@@ -108,16 +115,22 @@ def _run_index_job(
             raise TypeError(
                 f"Vector column {column_name!r} must be a fixed-size list, got {vector_type}"
             )
+        vector_count = table.count_rows(filter=f"{column_name} IS NOT NULL")
+        num_partitions = _suggest_num_partitions(vector_count)
         dataset = table.to_lance()
         with index_jobs_lock:
             index_jobs[job_id]["state"] = "running"
-            index_jobs[job_id]["stage"] = "GPU IVF-PQ training and assignment"
+            index_jobs[job_id]["stage"] = (
+                f"GPU IVF-PQ training ({vector_count} vectors, "
+                f"{num_partitions} partitions)"
+            )
         with gpu_lock:
             dataset.create_index(
                 column=column_name,
                 index_type="IVF_PQ",
                 metric="cosine",
                 accelerator="cuda",
+                num_partitions=num_partitions,
                 num_sub_vectors=_suggest_num_sub_vectors(dimension),
                 replace=True,
                 progress_callback=update_progress,
@@ -142,6 +155,7 @@ def _run_index_job(
                 }
             )
         print(f"IVF-PQ index job {job_id} failed: {exc}", flush=True)
+        traceback.print_exc()
 
 
 class EmbeddingHandler(BaseHTTPRequestHandler):
