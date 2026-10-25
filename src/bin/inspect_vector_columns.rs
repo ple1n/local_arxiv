@@ -1,7 +1,7 @@
 use futures::StreamExt;
 use lancedb::{
     arrow::{
-        arrow_array::{Array, FixedSizeListArray, Float32Array},
+        arrow_array::{Array, FixedSizeListArray, Float16Array, Float32Array},
         arrow_schema::DataType,
     },
     connect,
@@ -25,18 +25,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .fields()
         .iter()
         .filter_map(|field| match field.data_type() {
-            DataType::FixedSizeList(item, dimensions) if item.data_type() == &DataType::Float32 => {
-                Some((field.name().clone(), *dimensions as usize))
+            DataType::FixedSizeList(item, dimensions)
+                if matches!(item.data_type(), DataType::Float16 | DataType::Float32) =>
+            {
+                Some((
+                    field.name().clone(),
+                    *dimensions as usize,
+                    item.data_type().clone(),
+                ))
             }
             _ => None,
         })
         .collect();
     if vector_columns.is_empty() {
-        println!("No float32 fixed-size vector columns found.");
+        println!("No float16 or float32 fixed-size vector columns found.");
         return Ok(());
     }
 
-    for (column, dimensions) in vector_columns {
+    for (column, dimensions, value_type) in vector_columns {
         let populated = table
             .count_rows(Some(format!("{column} IS NOT NULL")))
             .await?;
@@ -69,13 +75,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 let values = vectors.value(row);
-                let values = values
-                    .as_any()
-                    .downcast_ref::<Float32Array>()
-                    .ok_or("vector values are not float32")?;
-                if values.len() != dimensions
-                    || values.values().iter().any(|value| !value.is_finite())
-                {
+                let invalid_values = match value_type {
+                    DataType::Float16 => {
+                        let values = values
+                            .as_any()
+                            .downcast_ref::<Float16Array>()
+                            .ok_or("vector values are not float16")?;
+                        values.values().iter().any(|value| !value.is_finite())
+                    }
+                    DataType::Float32 => {
+                        let values = values
+                            .as_any()
+                            .downcast_ref::<Float32Array>()
+                            .ok_or("vector values are not float32")?;
+                        values.values().iter().any(|value| !value.is_finite())
+                    }
+                    _ => unreachable!("filtered vector type must be float16 or float32"),
+                };
+                if values.len() != dimensions || invalid_values {
                     invalid += 1;
                 }
                 checked += 1;

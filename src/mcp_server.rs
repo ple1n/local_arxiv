@@ -55,6 +55,7 @@ const SEARCH_SNIPPET_CHARS: usize = 600;
 const MAX_PAPER_CHARS: usize = 1_000_000;
 const DEFAULT_EMBEDDING_CTX: usize = 32_768;
 const MAX_LFM_EMBEDDING_TOKENS: usize = 512;
+const EMBEDDING_CONCURRENCY: usize = 4;
 const DEFAULT_CHUNK_TOKEN_BUDGET: usize =
     MAX_LFM_EMBEDDING_TOKENS - crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM;
 
@@ -1158,22 +1159,52 @@ impl ArxivMcpServer {
                 let abstract_text = string_at(&batch, "abstract", row)?.unwrap_or_default();
                 papers.push((id, abstract_text));
             }
-            for group in papers.chunks(EMBEDDING_BATCH_SIZE) {
-                self.index_jobs.wait_until_resumed().await;
+            let groups = papers
+                .chunks(EMBEDDING_BATCH_SIZE)
+                .map(|group| group.to_vec())
+                .collect::<Vec<_>>();
+            self.index_jobs
+                .update(|progress| progress.phase = Some("embedding abstracts".to_owned()))
+                .await;
+            let mut embedded_groups = stream::iter(groups)
+                .map(|group| {
+                    let embedding_model = self.embedding_model.as_str();
+                    let embedding_ctx = self.embedding_ctx;
+                    let job_embedder = &job_embedder;
+                    async move {
+                        let vectors = crate::hybrid_pipeline::embed_abstract_vectors(
+                            &group,
+                            embedding_model,
+                            embedding_ctx,
+                            job_embedder,
+                        )
+                        .await;
+                        (group, vectors)
+                    }
+                })
+                .buffer_unordered(EMBEDDING_CONCURRENCY);
+            while let Some((group, vector_result)) = embedded_groups.next().await {
                 let current = group.last().map(|(id, _)| id.clone());
-                self.index_jobs
-                    .update(|progress| progress.phase = Some("embedding abstracts".to_owned()))
-                    .await;
-                match crate::hybrid_pipeline::embed_abstract_batch(
-                    table,
-                    group,
-                    &self.embedding_model,
-                    self.embedding_ctx,
-                    &job_embedder,
-                )
-                .await
-                {
-                    Ok(count) => embedded_count += count,
+                match vector_result {
+                    Ok(vectors) => {
+                        match crate::hybrid_pipeline::write_abstract_vectors(
+                            table,
+                            &group,
+                            vectors,
+                            &self.embedding_model,
+                        )
+                        .await
+                        {
+                            Ok(count) => embedded_count += count,
+                            Err(error) => {
+                                failed_count += group.len();
+                                eprintln!("Abstract batch write failed: {error}");
+                                self.index_jobs
+                                    .update(|progress| progress.error = Some(error.to_string()))
+                                    .await;
+                            }
+                        }
+                    }
                     Err(error) => {
                         failed_count += group.len();
                         eprintln!("Abstract batch embedding failed: {error}");
@@ -2684,7 +2715,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             SocketAddr::new(config.llama.host, config.llama.port)
         ),
         tokenizer,
-        Arc::new(Semaphore::new(1)),
+        Arc::new(Semaphore::new(EMBEDDING_CONCURRENCY)),
         index_jobs.clone(),
         index_build_progress.clone(),
     );

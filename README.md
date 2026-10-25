@@ -205,9 +205,17 @@ by default), and the model's 768-token context, minus 32 tokens of headroom.
 Over-limit direct embedding inputs are rejected rather than silently truncated.
 Pending legacy chunks are checked before embedding; oversized chunks are removed
 and regenerated with the tokenizer-safe chunker.
-All embedding requests share a single scheduler permit, so a new request waits
-until the previous embedding request has completed. Embeddings are normalized
-in Rust. Qwen reranking remains on llama-server's `/rerank` endpoint.
+Abstract vectors in `arxiv_metadata` are stored as fixed-size Float16 values;
+the model's normalized Float32 output is converted when written. IVF-PQ
+indexing and abstract vector search operate on that Float16 column. Existing
+Float32 abstract embedding columns are not migrated automatically: reset them
+with `nix develop --command cargo run --bin reset_abstract_embeddings`, then
+run abstract indexing again.
+
+Embedding requests share four scheduler permits. Abstract indexing sends batches
+of 32 papers with up to four embedding requests in flight; writes to the Lance
+table remain serialized. Embeddings are normalized in Rust. Qwen reranking
+remains on llama-server's `/rerank` endpoint.
 
 The GGUF and tokenizer are user-managed; the Rust backend does not download
 model files. Their paths and the tokenizer's Hugging Face repo are in

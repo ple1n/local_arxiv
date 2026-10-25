@@ -3,12 +3,13 @@ use crate::{
     test_pipeline::{Embedder, EmbeddingTask, Reranker},
 };
 use futures::StreamExt;
+use half::f16;
 use lancedb::{
     Connection, DistanceType, Table,
     arrow::{
         SendableRecordBatchStream,
         arrow_array::{
-            Array, BooleanArray, FixedSizeListArray, Float32Array, RecordBatch,
+            Array, BooleanArray, FixedSizeListArray, Float16Array, Float32Array, RecordBatch,
             RecordBatchIterator, RecordBatchReader, StringArray, UInt32Array, UInt64Array,
             new_null_array,
         },
@@ -868,7 +869,7 @@ impl<'a> HybridPipeline<'a> {
         match schema.field_with_name(&vector_column)?.data_type() {
             DataType::FixedSizeList(item, size)
                 if *size as usize == query_vector.len()
-                    && item.data_type() == &DataType::Float32 => {}
+                    && item.data_type() == &DataType::Float16 => {}
             _ => {
                 return Err(format!(
                     "query vector dimension or type does not match column {vector_column:?}"
@@ -1092,7 +1093,7 @@ impl<'a> HybridPipeline<'a> {
         match schema.field_with_name(&vector_column)?.data_type() {
             DataType::FixedSizeList(item, size)
                 if *size as usize == query_vector.len()
-                    && item.data_type() == &DataType::Float32 => {}
+                    && item.data_type() == &DataType::Float16 => {}
             _ => {
                 return Err(format!(
                     "query vector dimension or type does not match column {vector_column:?}"
@@ -1204,20 +1205,35 @@ pub async fn embed_abstract_batch(
         if papers.is_empty() {
             return Ok(0);
         }
-        return write_abstract_batch(table, &papers, embedding_model, ctx, embedder).await;
+        let vectors = embed_abstract_vectors(&papers, embedding_model, ctx, embedder).await?;
+        return write_abstract_vectors(table, &papers, vectors, embedding_model).await;
     }
-    write_abstract_batch(table, papers, embedding_model, ctx, embedder).await
+    let vectors = embed_abstract_vectors(papers, embedding_model, ctx, embedder).await?;
+    write_abstract_vectors(table, papers, vectors, embedding_model).await
 }
 
-async fn write_abstract_batch(
-    table: &Table,
+pub async fn embed_abstract_vectors(
     papers: &[(String, String)],
     embedding_model: &str,
     ctx: usize,
     embedder: &dyn Embedder,
-) -> PipelineResult<usize> {
-    let column = vector_column_name(embedding_model);
-    let ready_column = embedding_ready_column_name(embedding_model);
+) -> PipelineResult<Vec<Vec<f32>>> {
+    if papers.is_empty() {
+        return Ok(Vec::new());
+    }
+    if embedder.model_name() != embedding_model {
+        return Err(format!(
+            "selected embedding model {embedding_model:?} does not match embedder {:?}",
+            embedder.model_name()
+        )
+        .into());
+    }
+    if papers
+        .iter()
+        .any(|(_, abstract_text)| abstract_text.trim().is_empty())
+    {
+        return Err("cannot embed an empty abstract".into());
+    }
     let texts: Vec<String> = papers.iter().map(|(_, text)| text.clone()).collect();
     let vectors = embedder.embed(&texts, EmbeddingTask::Document, ctx).await?;
     let dimensions = vectors.first().map(Vec::len).unwrap_or(0);
@@ -1229,16 +1245,50 @@ async fn write_abstract_batch(
     {
         return Err("embedding service returned invalid vectors".into());
     }
-    if table.schema().await?.field_with_name(&column).is_err() {
-        let data_type = DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Float32, true)),
+    Ok(vectors)
+}
+
+pub async fn write_abstract_vectors(
+    table: &Table,
+    papers: &[(String, String)],
+    vectors: Vec<Vec<f32>>,
+    embedding_model: &str,
+) -> PipelineResult<usize> {
+    if papers.is_empty() {
+        return Ok(0);
+    }
+    let dimensions = vectors.first().map(Vec::len).unwrap_or(0);
+    if vectors.len() != papers.len()
+        || dimensions == 0
+        || vectors.iter().any(|vector| {
+            vector.len() != dimensions || vector.iter().any(|value| !value.is_finite())
+        })
+    {
+        return Err("embedding service returned invalid vectors".into());
+    }
+    let column = vector_column_name(embedding_model);
+    let ready_column = embedding_ready_column_name(embedding_model);
+    let table_schema = table.schema().await?;
+    if let Ok(field) = table_schema.field_with_name(&column) {
+        if !matches!(
+            field.data_type(),
+            DataType::FixedSizeList(item, size)
+                if *size as usize == dimensions && item.data_type() == &DataType::Float16
+        ) {
+            return Err(format!(
+                "vector column {column:?} must be a float16 fixed-size vector; reset the old embedding column before rebuilding"
+            )
+            .into());
+        }
+    } else {
+        let vector_type = DataType::FixedSizeList(
+            Arc::new(Field::new("item", DataType::Float16, true)),
             i32::try_from(dimensions)?,
         );
         table
             .add_columns()
             .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
-                Field::new(&column, data_type, true),
-                Field::new(&ready_column, DataType::Boolean, true),
+                Field::new(&column, vector_type, true),
             ]))))
             .execute()
             .await?;
@@ -1262,18 +1312,18 @@ async fn write_abstract_batch(
         Field::new(
             &column,
             DataType::FixedSizeList(
-                Arc::new(Field::new("item", DataType::Float32, true)),
+                Arc::new(Field::new("item", DataType::Float16, true)),
                 i32::try_from(dimensions)?,
             ),
             true,
         ),
         Field::new(&ready_column, DataType::Boolean, true),
     ]));
-    let vector_values: Vec<f32> = vectors.into_iter().flatten().collect();
+    let vector_values: Vec<f16> = vectors.into_iter().flatten().map(f16::from_f32).collect();
     let vector_array = Arc::new(FixedSizeListArray::try_new(
-        Arc::new(Field::new("item", DataType::Float32, true)),
+        Arc::new(Field::new("item", DataType::Float16, true)),
         i32::try_from(dimensions)?,
-        Arc::new(Float32Array::from(vector_values)),
+        Arc::new(Float16Array::from(vector_values)),
         None,
     )?);
     let batch = RecordBatch::try_new(
@@ -1455,10 +1505,10 @@ async fn ensure_vector_index_for_table(table: &Table, embedding_model: &str) -> 
     let field = schema.field_with_name(&column_name)?;
     if !matches!(
         field.data_type(),
-        DataType::FixedSizeList(item, _) if item.data_type() == &DataType::Float32
+        DataType::FixedSizeList(item, _) if item.data_type() == &DataType::Float16
     ) {
         return Err(
-            format!("vector column {column_name:?} is not a float32 fixed-size vector").into(),
+            format!("vector column {column_name:?} is not a float16 fixed-size vector").into(),
         );
     }
     let mut stream = table
@@ -1908,6 +1958,12 @@ mod tests {
         );
         let abstract_schema = metadata.schema().await?;
         assert_eq!(metadata.count_rows(None).await?, 17);
+        assert!(matches!(
+            abstract_schema
+                .field_with_name(&vector_column_name("mock-embedding"))?
+                .data_type(),
+            DataType::FixedSizeList(item, _) if item.data_type() == &DataType::Float16
+        ));
         assert!(
             !abstract_schema
                 .fields()
