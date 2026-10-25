@@ -74,9 +74,14 @@ The database path and table names remain backend environment settings:
 - `get_paper_text(paper_id, max_chars?)`: return stored paper text, capped at
   12,000 characters per call by default and at most, along with available
   metadata.
-- `test_paper_chunks(paper_id, query, candidate_limit?)`: search a paper's
-  retained test chunk table through the same hybrid retrieval pipeline used by
-  the `search_hybrid_chunks` tool.
+- `start_indexing_job(paper_id?, token_budget?)`: queue either one paper or all
+  papers still pending chunking/embedding. The backend owns the job and streams
+  progress at `/indexing-jobs/{job_id}/events`.
+- `test_paper_chunks(paper_id, query, candidate_limit?)`: index or resume the
+  paper through the shared corpus pipeline, then test its chunks using the
+  hybrid retrieval pipeline.
+- `chunk_paper(paper_id, token_budget?)`: preview chunk boundaries without
+  writing chunks or starting embedding.
 - `search_hybrid_chunks(chunk_table, query, embedding_model, reranker_model?,
   candidate_limit?)`: run lexical and dense retrieval against a named chunk
   table, fuse the ranked candidates with reciprocal rank fusion, then optionally
@@ -89,25 +94,27 @@ The database path and table names remain backend environment settings:
   model through llama-server and return the model and vector dimensions.
 - `dataset_status()`: report the configured table and its row count.
 
-In the paper reader, **Chunk paper** replaces that paper's retained
-`tmp_test_chunks_*` table with stable chunk IDs, text, and source byte offsets,
-then builds its FTS index. **Embed chunks** writes each batch into a
-model-specific fixed-size vector column and displays per-chunk progress. The
-selected model's vector index is built after the batches complete. Re-chunking
-replaces that test table; changing embedding models adds another vector column
-without overwriting the existing model's vectors.
+The paper reader's **Chunk paper** action previews chunk boundaries.
+**Embed chunks** queues a backend job; the browser subscribes to its progress
+stream and does not issue embedding batches itself. **Index pending papers**
+queues all papers not marked chunked and embedded in the main text table. Both
+paths use the same per-paper worker and global `arxiv_chunks` table.
 
-The query button uses LanceDB BM25 full-text search and vector search over that
-same table, fuses the two ranked lists with RRF (constant 60), and optionally
-reranks the fused candidates. The per-paper table is a small integration path
-through the same `HybridPipeline` chunk-write, embedding-write, index, and
-search methods intended for a corpus chunk table. Corpus callers can provide
-their own table name and call `upsert_paper_text` followed by
-`embed_paper_chunks` to process bounded batches through those same chunking,
-persistence, model-column, and index methods. The test-only
-`replace_paper_text` operation replaces its per-paper table. No full-corpus
-chunking or embedding import has been started; the existing paper-text search
-remains separate and lexical-only until such an import is requested.
+The main text table stores nullable `chunked` and `embedded` flags, model ID,
+chunk counts, and the latest indexing error. Boolean bitmap indexes support
+filtering pending work, while a B-tree index on `paper_id` supports state
+updates. A paper already marked `chunked` bypasses chunk creation/upsert and
+resumes embedding only for chunks missing vectors. Progress survives backend
+restarts in these per-paper fields; starting a new job resumes unfinished work.
+Batch embedding failures are retried per chunk so one bad passage does not mark
+its whole batch as failed. The vector index is finalized after the job.
+
+The query button uses LanceDB BM25 full-text search and vector search over the
+global chunk table, fuses the two ranked lists with RRF (constant 60), and
+optionally reranks the fused candidates. The one-paper test and corpus job share
+the same durable state transitions, chunk table, embedding adapter, and index
+finalization path. Full-corpus indexing is started explicitly from the UI; it
+does not begin automatically on server startup.
 
 The text and metadata live in separate LanceDB tables with native columns,
 linked by `paper_id`. Full-text search is indexed on `text`; the metadata table

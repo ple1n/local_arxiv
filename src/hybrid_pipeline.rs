@@ -25,6 +25,7 @@ use serde::Serialize;
 use std::{collections::HashMap, error::Error, sync::Arc};
 
 pub type PipelineResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
+pub const GLOBAL_CHUNK_TABLE: &str = "arxiv_chunks";
 
 #[derive(Clone, Debug)]
 pub struct TableNames {
@@ -434,6 +435,31 @@ impl<'a> HybridPipeline<'a> {
         embedder: &dyn Embedder,
         batch_size: usize,
     ) -> PipelineResult<usize> {
+        self.embed_paper_chunks_impl(paper_id, embedding_model, ctx, embedder, batch_size, true)
+            .await
+    }
+
+    pub async fn embed_paper_chunks_without_index(
+        &self,
+        paper_id: &str,
+        embedding_model: &str,
+        ctx: usize,
+        embedder: &dyn Embedder,
+        batch_size: usize,
+    ) -> PipelineResult<usize> {
+        self.embed_paper_chunks_impl(paper_id, embedding_model, ctx, embedder, batch_size, false)
+            .await
+    }
+
+    async fn embed_paper_chunks_impl(
+        &self,
+        paper_id: &str,
+        embedding_model: &str,
+        ctx: usize,
+        embedder: &dyn Embedder,
+        batch_size: usize,
+        finalize_index: bool,
+    ) -> PipelineResult<usize> {
         if !(1..=8).contains(&batch_size) {
             return Err("embedding batch size must be between 1 and 8".into());
         }
@@ -473,12 +499,86 @@ impl<'a> HybridPipeline<'a> {
                 .ok_or("chunk_id must be UTF-8")?;
             ids.extend((0..values.len()).map(|row| values.value(row).to_owned()));
         }
+        let mut failures = Vec::new();
         for batch in ids.chunks(batch_size) {
-            self.embed_chunk_batch(batch, embedding_model, ctx, embedder)
-                .await?;
+            if let Err(batch_error) = self
+                .embed_chunk_batch(batch, embedding_model, ctx, embedder)
+                .await
+            {
+                let mut batch_failures = Vec::new();
+                for chunk_id in batch {
+                    if let Err(error) = self
+                        .embed_chunk_batch(
+                            std::slice::from_ref(chunk_id),
+                            embedding_model,
+                            ctx,
+                            embedder,
+                        )
+                        .await
+                    {
+                        batch_failures.push(format!("{chunk_id}: {error}"));
+                    }
+                }
+                if !batch_failures.is_empty() {
+                    failures.extend(batch_failures);
+                    failures.push(format!("batch request also failed: {batch_error}"));
+                }
+            }
         }
-        self.ensure_vector_index(embedding_model).await?;
+        if !failures.is_empty() {
+            return Err(format!(
+                "{} chunks failed after individual retries: {}",
+                failures.len(),
+                failures.join("; ")
+            )
+            .into());
+        }
+        if finalize_index {
+            self.ensure_vector_index(embedding_model).await?;
+        }
         Ok(ids.len())
+    }
+
+    pub async fn paper_embedding_progress(
+        &self,
+        paper_id: &str,
+        embedding_model: &str,
+    ) -> PipelineResult<(usize, usize)> {
+        let table = self
+            .connection
+            .open_table(&self.tables.chunks)
+            .execute()
+            .await?;
+        let schema = table.schema().await?;
+        let vector_column = vector_column_name(embedding_model);
+        let has_vector_column = schema.field_with_name(&vector_column).is_ok();
+        let columns = if has_vector_column {
+            vec!["chunk_id", vector_column.as_str()]
+        } else {
+            vec!["chunk_id"]
+        };
+        let escaped_id = paper_id.replace('\'', "''");
+        let mut stream = table
+            .query()
+            .only_if(format!("paper_id = '{escaped_id}'"))
+            .select(Select::columns(&columns))
+            .execute()
+            .await?;
+        let mut total = 0;
+        let mut embedded = 0;
+        while let Some(batch) = stream.next().await {
+            let batch = batch?;
+            total += batch.num_rows();
+            if has_vector_column {
+                let values = batch
+                    .column_by_name(&vector_column)
+                    .ok_or("vector column missing from chunk batch")?;
+                embedded += (0..values.len())
+                    .filter(|row| !values.is_null(*row))
+                    .count();
+            }
+        }
+        Ok((total, embedded))
     }
 
     pub fn test_table_name(paper_id: &str) -> String {

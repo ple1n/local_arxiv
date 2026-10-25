@@ -71,9 +71,22 @@ type ChunkApiResponse = Omit<ChunkResponse, "chunks"> & {
   chunks: PaperChunk[];
 };
 
-type EmbeddingResponse = {
-  model: string;
-  count: number;
+type IndexJobProgress = {
+  job_id: string;
+  state: "queued" | "running" | "complete" | "complete_with_errors" | "failed";
+  total_papers: number;
+  scanned_papers: number;
+  chunked_papers: number;
+  embedded_papers: number;
+  failed_papers: number;
+  current_paper: string | null;
+  error: string | null;
+};
+
+type StartIndexJobResponse = {
+  job_id: string;
+  events_url: string;
+  state: string;
 };
 
 type AvailableModel = {
@@ -391,6 +404,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const serverAddress = new URL(apiBaseUrl).host;
   const clientRef = useRef<Client | null>(null);
   const transportRef = useRef<StreamableHTTPClientTransport | null>(null);
+  const jobEventSourceRef = useRef<EventSource | null>(null);
   const [query, setQuery] = useState(initialParams.get("query") ?? "");
   const [searchUrl, setSearchUrl] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -407,8 +421,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [chunkBusy, setChunkBusy] = useState(false);
   const [embeddingBusy, setEmbeddingBusy] = useState(false);
   const [chunkError, setChunkError] = useState("");
-  const [embeddingProgress, setEmbeddingProgress] = useState({ completed: 0, total: 0 });
   const [embeddingModel, setEmbeddingModel] = useState("");
+  const [indexJobProgress, setIndexJobProgress] = useState<IndexJobProgress | null>(null);
   const [rerankQuery, setRerankQuery] = useState("");
   const [queryPipelineBusy, setQueryPipelineBusy] = useState(false);
   const [queryPipelineResult, setQueryPipelineResult] = useState<QueryPipelineResponse | null>(null);
@@ -493,6 +507,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
 
     return () => {
       active = false;
+      jobEventSourceRef.current?.close();
+      jobEventSourceRef.current = null;
       void client.close();
       clientRef.current = null;
       transportRef.current = null;
@@ -613,7 +629,6 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
           embeddingStatus: "pending",
         })),
       });
-      setEmbeddingProgress({ completed: 0, total: result.chunks.length });
       setEmbeddingModel("");
       setChunkView(true);
     } catch (reason) {
@@ -623,98 +638,73 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
     }
   }
 
-  async function embedPaperChunks() {
+  async function startIndexingJob(paperId?: string) {
     const client = clientRef.current;
-    if (!client || !chunkResult || embeddingBusy || chunkResult.chunks.length === 0) return;
-
-    const remaining = chunkResult.chunks
-      .map((chunk, index) => ({ chunk, index }))
-      .filter(({ chunk }) => chunk.embeddingStatus !== "done");
-    if (remaining.length === 0) return;
-
-    const completedInitially = chunkResult.chunks.length - remaining.length;
+    if (!client || embeddingBusy) return;
+    jobEventSourceRef.current?.close();
+    jobEventSourceRef.current = null;
     setEmbeddingBusy(true);
     setChunkError("");
-    setEmbeddingProgress({ completed: completedInitially, total: chunkResult.chunks.length });
-
-    let completed = completedInitially;
-    let failed = 0;
-    let succeeded = 0;
-    let finalizeError = "";
-    for (let start = 0; start < remaining.length; start += 4) {
-      const batch = remaining.slice(start, start + 4);
-      const batchIndices = new Set(batch.map(({ index }) => index));
-      setChunkResult((current) => current && ({
-        ...current,
-        chunks: current.chunks.map((chunk, index) =>
-          batchIndices.has(index)
-            ? { ...chunk, embeddingStatus: "embedding", embeddingError: undefined }
-            : chunk,
-        ),
-      }));
-      try {
-        const response = await client.callTool({
-          name: "embed_chunk_batch",
-          arguments: {
-            chunk_table: chunkResult.chunk_table,
-            chunk_ids: batch.map(({ chunk }) => chunk.chunk_id),
-            model: selectedEmbeddingModel,
-          },
-        });
-        const result = JSON.parse(
-          getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
-        ) as EmbeddingResponse;
-        if (result.count !== batch.length || !result.model) {
-          throw new Error("Embedding service returned incomplete batch metadata");
+    setIndexJobProgress(null);
+    try {
+      const response = await client.callTool({
+        name: "start_indexing_job",
+        arguments: paperId
+          ? { paper_id: paperId, token_budget: tokenBudget }
+          : {},
+      });
+      const job = JSON.parse(
+        getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
+      ) as StartIndexJobResponse;
+      const events = new EventSource(new URL(job.events_url, apiBaseUrl));
+      jobEventSourceRef.current = events;
+      events.addEventListener("progress", (event) => {
+        const progress = JSON.parse((event as MessageEvent<string>).data) as IndexJobProgress;
+        setIndexJobProgress(progress);
+        if (progress.state === "complete" || progress.state === "complete_with_errors" || progress.state === "failed") {
+          events.close();
+          if (jobEventSourceRef.current === events) jobEventSourceRef.current = null;
+          setEmbeddingBusy(false);
+          if (paperId && progress.embedded_papers > 0 && progress.failed_papers === 0) {
+            setEmbeddingModel(selectedEmbeddingModel);
+            setChunkResult((current) => current && ({
+              ...current,
+              chunks: current.chunks.map((chunk) => ({
+                ...chunk,
+                embeddingStatus: "done",
+                embeddingError: undefined,
+              })),
+            }));
+          }
+          if (progress.failed_papers > 0 || progress.error) {
+            setChunkError(
+              progress.error ??
+                `${progress.failed_papers} paper${progress.failed_papers === 1 ? "" : "s"} had embedding failures. Retry the job to resume missing vectors.`,
+            );
+          }
         }
-        setEmbeddingModel(result.model);
-        succeeded += batch.length;
-        setChunkResult((current) => current && ({
-          ...current,
-          chunks: current.chunks.map((chunk, index) =>
-            batchIndices.has(index) ? { ...chunk, embeddingStatus: "done" } : chunk,
-          ),
-        }));
-      } catch (reason) {
-        failed += batch.length;
-        const message = reason instanceof Error ? reason.message : String(reason);
-        setChunkResult((current) => current && ({
-          ...current,
-          chunks: current.chunks.map((chunk, index) =>
-            batchIndices.has(index)
-              ? { ...chunk, embeddingStatus: "failed", embeddingError: message }
-              : chunk,
-          ),
-        }));
-      }
-      completed += batch.length;
-      setEmbeddingProgress({ completed, total: chunkResult.chunks.length });
+      });
+      events.onerror = () => {
+        if (events.readyState === EventSource.CLOSED) {
+          setEmbeddingBusy(false);
+          setChunkError("Lost the indexing progress stream. The backend job may still be running; reconnect to its events to check.");
+        }
+      };
+    } catch (reason) {
+      setEmbeddingBusy(false);
+      setChunkError(reason instanceof Error ? reason.message : String(reason));
     }
+  }
 
-    if (succeeded > 0) {
-      try {
-        const response = await client.callTool({
-          name: "finalize_chunk_embeddings",
-          arguments: {
-            chunk_table: chunkResult.chunk_table,
-            model: selectedEmbeddingModel,
-          },
-        });
-        getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean });
-      } catch (reason) {
-        finalizeError = reason instanceof Error ? reason.message : String(reason);
-      }
-    }
+  async function embedPaperChunks() {
+    if (!selected || !chunkResult || chunkResult.chunks.length === 0) return;
+    await startIndexingJob(selected.paper_id);
+  }
 
-    if (failed > 0) {
-      setChunkError(
-        `${failed} chunk${failed === 1 ? "" : "s"} failed to embed. Failed chunks can be retried.` +
-          (finalizeError ? ` Vector index error: ${finalizeError}` : ""),
-      );
-    } else if (finalizeError) {
-      setChunkError(`Embeddings were saved, but the vector index could not be created: ${finalizeError}`);
+  async function startFullIndexingJob() {
+    if (window.confirm("Queue every paper that is not fully chunked and embedded? This may run for a long time.")) {
+      await startIndexingJob();
     }
-    setEmbeddingBusy(false);
   }
 
   async function testQueryPipeline() {
@@ -753,6 +743,22 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
         </a>
         <span className="connection"><i />{status}</span>
       </header>
+      {indexJobProgress && (
+        <div className="embedding-progress" aria-live="polite">
+          <progress
+            aria-label="Backend indexing progress"
+            max={Math.max(indexJobProgress.total_papers, 1)}
+            value={indexJobProgress.scanned_papers}
+          />
+          <span>
+            Index job {indexJobProgress.state}: {indexJobProgress.scanned_papers.toLocaleString()} /{" "}
+            {indexJobProgress.total_papers.toLocaleString()} papers scanned ·{" "}
+            {indexJobProgress.embedded_papers.toLocaleString()} embedded ·{" "}
+            {indexJobProgress.failed_papers.toLocaleString()} failed
+            {indexJobProgress.current_paper && ` · current: ${indexJobProgress.current_paper}`}
+          </span>
+        </div>
+      )}
 
       {!selected && (
         <>
@@ -781,6 +787,13 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             />
             Render LaTeX
           </label>
+          <button
+            className="chunk-button"
+            onClick={() => void startFullIndexingJob()}
+            disabled={embeddingBusy || !selectedEmbeddingModel}
+          >
+            {embeddingBusy ? "Indexing…" : "Index pending papers"}
+          </button>
         </div>
       </section>
 
@@ -881,7 +894,6 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                   onChange={(event) => {
                     setSelectedEmbeddingModel(event.target.value);
                     setEmbeddingModel("");
-                    setEmbeddingProgress({ completed: 0, total: chunkResult?.chunks.length ?? 0 });
                     setChunkResult((current) => current && ({
                       ...current,
                       chunks: current.chunks.map((chunk) => ({
@@ -943,7 +955,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                   chunkResult.chunks.every((chunk) => chunk.embeddingStatus === "done")
                 }
               >
-                {embeddingBusy ? "Embedding…" : "Embed chunks"}
+                {embeddingBusy ? "Indexing…" : "Index / resume paper"}
               </button>
               {chunkView && (
                 <button className="chunk-button secondary" onClick={() => setChunkView(false)}>
@@ -1012,19 +1024,6 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                   ))}
                 </div>
               </section>
-            )}
-            {embeddingProgress.total > 0 && (embeddingBusy || embeddingProgress.completed > 0) && (
-              <div className="embedding-progress">
-                <progress
-                  aria-label="Chunk embedding progress"
-                  max={embeddingProgress.total}
-                  value={embeddingProgress.completed}
-                />
-                <span>
-                  {embeddingProgress.completed} / {embeddingProgress.total} chunks processed
-                  {embeddingModel && ` · ${embeddingModel}`}
-                </span>
-              </div>
             )}
             {chunkError && <div className="error-box">{chunkError}</div>}
             {chunkView && chunkResult && (

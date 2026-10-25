@@ -1,12 +1,22 @@
 use crate::test_pipeline::Embedder;
-use axum::{Json, Router, http::HeaderName};
-use futures::StreamExt;
+use axum::{
+    Json, Router,
+    extract::Path,
+    http::HeaderName,
+    response::sse::{Event, KeepAlive, Sse},
+    routing::get,
+};
+use futures::{StreamExt, stream};
 use lancedb::{
     Table,
-    arrow::arrow_array::{Array, LargeStringArray, StringArray},
+    arrow::arrow_array::{Array, BooleanArray, LargeStringArray, StringArray},
     connect,
-    index::scalar::FullTextSearchQuery,
+    index::{
+        Index,
+        scalar::{BTreeIndexBuilder, BitmapIndexBuilder, FullTextSearchQuery},
+    },
     query::{ExecutableQuery, QueryBase, Select},
+    table::NewColumnTransform,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -23,10 +33,14 @@ use std::{
     env,
     error::Error,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     time::Instant,
 };
 use tokenizers::Tokenizer;
+use tokio::sync::{RwLock, broadcast};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::ServeDir,
@@ -39,6 +53,104 @@ const SEARCH_SNIPPET_CHARS: usize = 600;
 const MAX_PAPER_CHARS: usize = 1_000_000;
 const DEFAULT_EMBEDDING_CTX: usize = 32_768;
 const MAX_LFM_EMBEDDING_TOKENS: usize = 512;
+const DEFAULT_CHUNK_TOKEN_BUDGET: usize = 512;
+
+static NEXT_INDEX_JOB_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Debug, Serialize)]
+struct IndexJobProgress {
+    job_id: String,
+    state: String,
+    total_papers: usize,
+    scanned_papers: usize,
+    chunked_papers: usize,
+    embedded_papers: usize,
+    failed_papers: usize,
+    current_paper: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct IndexJobManager {
+    progress: Arc<RwLock<Option<IndexJobProgress>>>,
+    updates: broadcast::Sender<IndexJobProgress>,
+    active: Arc<AtomicBool>,
+}
+
+impl IndexJobManager {
+    fn new() -> Self {
+        let (updates, _) = broadcast::channel(32);
+        Self {
+            progress: Arc::new(RwLock::new(None)),
+            updates,
+            active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    async fn start(&self, paper_id: Option<String>, total_papers: usize) -> Result<String, String> {
+        if self
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("An indexing job is already running".to_owned());
+        }
+        let job_id = format!(
+            "{}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| error.to_string())?
+                .as_millis(),
+            NEXT_INDEX_JOB_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let initial = IndexJobProgress {
+            job_id: job_id.clone(),
+            state: "queued".to_owned(),
+            total_papers,
+            scanned_papers: 0,
+            chunked_papers: 0,
+            embedded_papers: 0,
+            failed_papers: 0,
+            current_paper: paper_id,
+            error: None,
+        };
+        *self.progress.write().await = Some(initial.clone());
+        let _ = self.updates.send(initial);
+        Ok(job_id)
+    }
+
+    async fn update(&self, update: impl FnOnce(&mut IndexJobProgress)) {
+        if let Some(progress) = self.progress.write().await.as_mut() {
+            update(progress);
+            let _ = self.updates.send(progress.clone());
+        }
+    }
+
+    async fn finish(&self, state: &str, error: Option<String>) {
+        self.update(|progress| {
+            progress.state = state.to_owned();
+            progress.current_paper = None;
+            progress.error = error;
+        })
+        .await;
+        self.active.store(false, Ordering::Release);
+    }
+
+    async fn subscribe(
+        &self,
+        job_id: &str,
+    ) -> Result<(IndexJobProgress, broadcast::Receiver<IndexJobProgress>), String> {
+        let receiver = self.updates.subscribe();
+        let current = self
+            .progress
+            .read()
+            .await
+            .clone()
+            .filter(|progress| progress.job_id == job_id)
+            .ok_or_else(|| format!("No indexing job found with ID {job_id:?}"))?;
+        Ok((current, receiver))
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +292,16 @@ struct HybridChunkSearchArgs {
     ctx: Option<usize>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct StartIndexJobArgs {
+    #[schemars(
+        description = "Optional paper ID for a one-paper run; omit to process all pending papers"
+    )]
+    paper_id: Option<String>,
+    #[schemars(description = "Chunk token budget; defaults to 512")]
+    token_budget: Option<usize>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ModelListResponse {
     data: Vec<ModelListItem>,
@@ -264,6 +386,7 @@ struct ArxivMcpServer {
     embedding_tokenizer: Arc<Tokenizer>,
     embedding_ctx: usize,
     embedding_max_tokens: usize,
+    index_jobs: IndexJobManager,
     #[expect(dead_code, reason = "tool_handler macro reads this router")]
     tool_router: ToolRouter<Self>,
 }
@@ -281,6 +404,7 @@ impl ArxivMcpServer {
         model_list_endpoint: String,
         reranker_endpoint: String,
         embedding_tokenizer: Arc<Tokenizer>,
+        index_jobs: IndexJobManager,
     ) -> Self {
         Self {
             table,
@@ -296,6 +420,7 @@ impl ArxivMcpServer {
             embedding_tokenizer,
             embedding_ctx: DEFAULT_EMBEDDING_CTX,
             embedding_max_tokens: embedding.max_tokens,
+            index_jobs,
             tool_router: Self::tool_router(),
         }
     }
@@ -316,6 +441,312 @@ impl ArxivMcpServer {
             &self.reranker_endpoint,
         )
         .map_err(internal_error)
+    }
+
+    async fn run_index_job(
+        &self,
+        paper_id: Option<String>,
+        token_budget: usize,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let database = connect(&self.database_path).execute().await?;
+        let filter = if let Some(paper_id) = &paper_id {
+            format!("paper_id = {}", sql_string(paper_id))
+        } else {
+            pending_index_filter(&self.embedding_model)
+        };
+        let mut rows = self
+            .table
+            .query()
+            .only_if(filter)
+            .select(Select::columns(&[
+                "paper_id",
+                "text",
+                "chunked",
+                "embedded",
+                "embedding_model",
+            ]))
+            .execute()
+            .await?;
+        let mut scanned = 0;
+        let mut chunked_count = 0;
+        let mut embedded_count = 0;
+        let mut failed_count = 0;
+        while let Some(batch) = rows.next().await {
+            let batch = batch?;
+            for row in 0..batch.num_rows() {
+                let current_id = string_at(&batch, "paper_id", row)?
+                    .ok_or("indexing source row has a null paper_id")?;
+                let text = string_at(&batch, "text", row)?
+                    .ok_or_else(|| format!("paper {current_id:?} has null text"))?;
+                let chunked = optional_bool_value(
+                    batch
+                        .column_by_name("chunked")
+                        .ok_or("missing chunked state")?
+                        .as_ref(),
+                    row,
+                )?;
+                let embedded = optional_bool_value(
+                    batch
+                        .column_by_name("embedded")
+                        .ok_or("missing embedded state")?
+                        .as_ref(),
+                    row,
+                )?;
+                let indexed_model = string_at(&batch, "embedding_model", row)?;
+                if paper_id.is_some() {
+                    self.index_jobs
+                        .update(|progress| progress.current_paper = Some(current_id.clone()))
+                        .await;
+                }
+                match self
+                    .process_paper(
+                        &database,
+                        &current_id,
+                        &text,
+                        chunked,
+                        embedded,
+                        indexed_model.as_deref(),
+                        self.embedding_ctx,
+                        token_budget,
+                        paper_id.is_some(),
+                    )
+                    .await
+                {
+                    Ok((_, true)) => {
+                        if chunked != Some(true) {
+                            chunked_count += 1;
+                        }
+                        embedded_count += 1;
+                    }
+                    Ok((_, false)) => {}
+                    Err(error) => {
+                        failed_count += 1;
+                        update_paper_index_state(
+                            &self.table,
+                            &current_id,
+                            &[("indexing_error", sql_string(&error.to_string()))],
+                        )
+                        .await?;
+                    }
+                }
+                scanned += 1;
+                if scanned % 100 == 0 || paper_id.is_some() {
+                    self.index_jobs
+                        .update(|progress| {
+                            progress.scanned_papers = scanned;
+                            progress.chunked_papers = chunked_count;
+                            progress.embedded_papers = embedded_count;
+                            progress.failed_papers = failed_count;
+                            progress.current_paper = Some(current_id);
+                        })
+                        .await;
+                }
+            }
+        }
+        if paper_id.is_some() && scanned == 0 {
+            return Err(format!(
+                "No paper found with paper_id {:?}",
+                paper_id.as_deref().unwrap_or_default()
+            )
+            .into());
+        }
+        self.index_jobs
+            .update(|progress| {
+                progress.scanned_papers = scanned;
+                progress.chunked_papers = chunked_count;
+                progress.embedded_papers = embedded_count;
+                progress.failed_papers = failed_count;
+            })
+            .await;
+        if embedded_count > 0 {
+            let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
+                &database,
+                crate::hybrid_pipeline::TableNames {
+                    chunks: crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE.to_owned(),
+                },
+            );
+            pipeline.ensure_vector_index(&self.embedding_model).await?;
+        }
+        Ok(())
+    }
+
+    async fn index_one_paper(
+        &self,
+        paper_id: &str,
+        ctx: usize,
+        token_budget: usize,
+    ) -> Result<(usize, bool), Box<dyn Error + Send + Sync>> {
+        let escaped_id = paper_id.replace('\'', "''");
+        let mut rows = self
+            .table
+            .query()
+            .only_if(format!("paper_id = '{escaped_id}'"))
+            .select(Select::columns(&[
+                "paper_id",
+                "text",
+                "chunked",
+                "embedded",
+                "embedding_model",
+            ]))
+            .limit(1)
+            .execute()
+            .await?;
+        while let Some(batch) = rows.next().await {
+            let batch = batch?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let id = string_at(&batch, "paper_id", 0)?
+                .ok_or("indexing source row has a null paper_id")?;
+            let text = string_at(&batch, "text", 0)?
+                .ok_or_else(|| format!("paper {id:?} has null text"))?;
+            let chunked = optional_bool_value(
+                batch
+                    .column_by_name("chunked")
+                    .ok_or("missing chunked state")?
+                    .as_ref(),
+                0,
+            )?;
+            let embedded = optional_bool_value(
+                batch
+                    .column_by_name("embedded")
+                    .ok_or("missing embedded state")?
+                    .as_ref(),
+                0,
+            )?;
+            let model = string_at(&batch, "embedding_model", 0)?;
+            let database = connect(&self.database_path).execute().await?;
+            return self
+                .process_paper(
+                    &database,
+                    &id,
+                    &text,
+                    chunked,
+                    embedded,
+                    model.as_deref(),
+                    ctx,
+                    token_budget,
+                    true,
+                )
+                .await;
+        }
+        Err(format!("No paper found with paper_id {paper_id:?}").into())
+    }
+
+    async fn process_paper(
+        &self,
+        database: &lancedb::Connection,
+        paper_id: &str,
+        text: &str,
+        chunked: Option<bool>,
+        embedded: Option<bool>,
+        indexed_model: Option<&str>,
+        ctx: usize,
+        token_budget: usize,
+        finalize_index: bool,
+    ) -> Result<(usize, bool), Box<dyn Error + Send + Sync>> {
+        let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
+            database,
+            crate::hybrid_pipeline::TableNames {
+                chunks: crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE.to_owned(),
+            },
+        );
+        let same_model = indexed_model == Some(self.embedding_model.as_str());
+        if chunked != Some(true) {
+            let chunks = crate::chunking::chunk_text(text, token_budget);
+            if chunks.is_empty() {
+                return Err(format!("paper {paper_id:?} produced no chunks").into());
+            }
+            pipeline.upsert_chunks(paper_id, &chunks).await?;
+            let chunk_count = chunks.len();
+            update_paper_index_state(
+                &self.table,
+                paper_id,
+                &[
+                    ("chunked", "true".to_owned()),
+                    ("embedded", "false".to_owned()),
+                    ("embedding_model", sql_string(&self.embedding_model)),
+                    ("chunk_count", chunk_count.to_string()),
+                    ("embedded_chunk_count", "0".to_owned()),
+                    ("indexing_error", "NULL".to_owned()),
+                ],
+            )
+            .await?;
+        } else if embedded == Some(true) && same_model {
+            let (total, _) = pipeline
+                .paper_embedding_progress(paper_id, &self.embedding_model)
+                .await?;
+            return Ok((total, true));
+        } else if !same_model {
+            update_paper_index_state(
+                &self.table,
+                paper_id,
+                &[
+                    ("embedded", "false".to_owned()),
+                    ("embedding_model", sql_string(&self.embedding_model)),
+                    ("embedded_chunk_count", "0".to_owned()),
+                    ("indexing_error", "NULL".to_owned()),
+                ],
+            )
+            .await?;
+        }
+
+        let embedder = self.embedder(&self.embedding_model)?;
+        let embedding = if finalize_index {
+            pipeline
+                .embed_paper_chunks(paper_id, &self.embedding_model, ctx, &embedder, 4)
+                .await
+        } else {
+            pipeline
+                .embed_paper_chunks_without_index(
+                    paper_id,
+                    &self.embedding_model,
+                    ctx,
+                    &embedder,
+                    4,
+                )
+                .await
+        };
+        match embedding {
+            Ok(_) => {
+                let (chunk_count, embedded_count) = pipeline
+                    .paper_embedding_progress(paper_id, &self.embedding_model)
+                    .await?;
+                update_paper_index_state(
+                    &self.table,
+                    paper_id,
+                    &[
+                        ("chunked", "true".to_owned()),
+                        ("embedded", "true".to_owned()),
+                        ("embedding_model", sql_string(&self.embedding_model)),
+                        ("chunk_count", chunk_count.to_string()),
+                        ("embedded_chunk_count", embedded_count.to_string()),
+                        ("indexing_error", "NULL".to_owned()),
+                    ],
+                )
+                .await?;
+                Ok((chunk_count, true))
+            }
+            Err(error) => {
+                let (total, embedded_count) = pipeline
+                    .paper_embedding_progress(paper_id, &self.embedding_model)
+                    .await?;
+                update_paper_index_state(
+                    &self.table,
+                    paper_id,
+                    &[
+                        ("chunked", "true".to_owned()),
+                        ("embedded", "false".to_owned()),
+                        ("embedding_model", sql_string(&self.embedding_model)),
+                        ("chunk_count", total.to_string()),
+                        ("embedded_chunk_count", embedded_count.to_string()),
+                        ("indexing_error", sql_string(&error.to_string())),
+                    ],
+                )
+                .await?;
+                Err(error)
+            }
+        }
     }
 }
 
@@ -482,7 +913,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Chunk a paper and replace its retained per-paper test table. Writes chunk text and offsets and builds one FTS index."
+        description = "Preview how a paper will be chunked. This does not write chunks; start_indexing_job performs durable indexing."
     )]
     async fn chunk_paper(
         &self,
@@ -525,21 +956,8 @@ impl ArxivMcpServer {
                 .map_err(internal_error)?
                 .unwrap_or_default();
             let (source, truncated) = truncate_chars(source, MAX_PAPER_CHARS);
-            let table_name = crate::hybrid_pipeline::HybridPipeline::test_table_name(paper_id);
-            let database = connect(&self.database_path)
-                .execute()
-                .await
-                .map_err(internal_error)?;
-            let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
-                &database,
-                crate::hybrid_pipeline::TableNames {
-                    chunks: table_name.clone(),
-                },
-            );
-            let chunks = pipeline
-                .replace_paper_text(paper_id, &source, token_budget)
-                .await
-                .map_err(internal_error)?;
+            let table_name = crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE;
+            let chunks = crate::chunking::chunk_text(&source, token_budget);
             return serde_json::to_string_pretty(&serde_json::json!({
                 "paper_id": id,
                 "chunk_table": table_name,
@@ -561,6 +979,74 @@ impl ArxivMcpServer {
             format!("No paper found with paper_id {paper_id:?} in this table."),
             None,
         ))
+    }
+
+    #[tool(
+        description = "Queue indexing for one paper, or all papers not yet chunked and embedded. Progress is streamed from the backend."
+    )]
+    async fn start_indexing_job(
+        &self,
+        Parameters(args): Parameters<StartIndexJobArgs>,
+    ) -> Result<String, McpError> {
+        let paper_id = args.paper_id.map(|value| value.trim().to_owned());
+        if paper_id
+            .as_deref()
+            .is_some_and(|id| id.is_empty() || id.len() > 128)
+        {
+            return Err(McpError::invalid_params(
+                "paper_id must contain between 1 and 128 bytes",
+                None,
+            ));
+        }
+        let token_budget = args.token_budget.unwrap_or(DEFAULT_CHUNK_TOKEN_BUDGET);
+        if token_budget == 0 || token_budget > 2_048 {
+            return Err(McpError::invalid_params(
+                "token_budget must be between 1 and 2048",
+                None,
+            ));
+        }
+        let total_papers = if paper_id.is_some() {
+            self.table
+                .count_rows(Some(format!(
+                    "paper_id = {}",
+                    sql_string(paper_id.as_deref().unwrap_or_default())
+                )))
+                .await
+                .map_err(internal_error)?
+        } else {
+            self.table
+                .count_rows(Some(pending_index_filter(&self.embedding_model)))
+                .await
+                .map_err(internal_error)?
+        };
+        if total_papers == 0 {
+            return Err(McpError::invalid_params(
+                "There are no papers pending indexing",
+                None,
+            ));
+        }
+        let job_id = self
+            .index_jobs
+            .start(paper_id.clone(), total_papers)
+            .await
+            .map_err(|error| McpError::invalid_request(error, None))?;
+        let server = self.clone();
+        let jobs = self.index_jobs.clone();
+        let running_id = job_id.clone();
+        tokio::spawn(async move {
+            jobs.update(|progress| progress.state = "running".to_owned())
+                .await;
+            match server.run_index_job(paper_id, token_budget).await {
+                Ok(()) => jobs.finish("complete", None).await,
+                Err(error) => jobs.finish("failed", Some(error.to_string())).await,
+            };
+        });
+        Ok(serde_json::json!({
+            "job_id": running_id,
+            "events_url": format!("/indexing-jobs/{running_id}/events"),
+            "state": "queued",
+        })
+        .to_string())
     }
 
     #[tool(
@@ -668,7 +1154,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Embed and persist up to 8 chunks using the configured LFM model in the paper's test table."
+        description = "Low-level embedding operation for up to 8 chunk IDs in a chunk table. Prefer start_indexing_job for resumable paper or corpus indexing."
     )]
     async fn embed_chunk_batch(
         &self,
@@ -852,7 +1338,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Search the retained chunk table for a paper through the shared lexical, dense, reciprocal-rank-fusion, and reranking pipeline. Chunk and embed the paper first."
+        description = "Index or resume a paper through the shared corpus pipeline, then test it with lexical, dense, reciprocal-rank-fusion, and optional reranking."
     )]
     async fn test_paper_chunks(
         &self,
@@ -900,7 +1386,7 @@ impl ArxivMcpServer {
             ));
         }
         let ctx = validate_embedding_ctx(args.ctx.unwrap_or(self.embedding_ctx))?;
-        let table_name = crate::hybrid_pipeline::HybridPipeline::test_table_name(paper_id);
+        let table_name = crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE;
         let database = connect(&self.database_path)
             .execute()
             .await
@@ -915,6 +1401,9 @@ impl ArxivMcpServer {
                 None,
             ));
         }
+        self.index_one_paper(paper_id, ctx, DEFAULT_CHUNK_TOKEN_BUDGET)
+            .await
+            .map_err(internal_error)?;
         let embedder = self.embedder(embedding_model)?;
         let reranker = args
             .reranker_model
@@ -923,7 +1412,9 @@ impl ArxivMcpServer {
             .transpose()?;
         let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
             &database,
-            crate::hybrid_pipeline::TableNames { chunks: table_name },
+            crate::hybrid_pipeline::TableNames {
+                chunks: table_name.to_owned(),
+            },
         );
         let result = pipeline
             .search(
@@ -1053,6 +1544,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
 
     let database = connect(&database_path).execute().await?;
     let table = database.open_table(&table_name).execute().await?;
+    ensure_indexing_state_fields(&table).await?;
     let indices = table.list_indices().await?;
     if !indices.iter().any(|index| {
         index.index_type.to_string() == "FTS" && index.columns.iter().any(|column| column == "text")
@@ -1076,6 +1568,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         .into());
     }
     let metadata_row_count = metadata_table.count_rows(None).await?;
+    let index_jobs = IndexJobManager::new();
     let server = ArxivMcpServer::new(
         table,
         metadata_table,
@@ -1097,6 +1590,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             SocketAddr::new(config.llama.host, config.llama.port)
         ),
         tokenizer,
+        index_jobs.clone(),
     );
 
     let service: StreamableHttpService<ArxivMcpServer, LocalSessionManager> =
@@ -1106,8 +1600,16 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             Default::default(),
         );
     let runtime_config = config.clone();
+    let event_jobs = index_jobs.clone();
     let router = Router::new()
         .route("/health", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/indexing-jobs/{job_id}/events",
+            get(move |Path(job_id): Path<String>| {
+                let manager = event_jobs.clone();
+                async move { index_job_events(manager, job_id).await }
+            }),
+        )
         .route(
             "/runtime-config.json",
             axum::routing::get(move || {
@@ -1133,6 +1635,86 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+async fn ensure_indexing_state_fields(table: &Table) -> Result<(), Box<dyn Error>> {
+    let schema = table.schema().await?;
+    let expressions = [
+        ("chunked", "false"),
+        ("embedded", "false"),
+        ("embedding_model", "CAST(NULL AS STRING)"),
+        ("chunk_count", "CAST(NULL AS INTEGER)"),
+        ("embedded_chunk_count", "CAST(NULL AS INTEGER)"),
+        ("indexing_error", "CAST(NULL AS STRING)"),
+    ];
+    let missing_expressions = expressions
+        .into_iter()
+        .filter(|(name, _)| schema.field_with_name(name).is_err())
+        .map(|(name, expression)| (name.to_owned(), expression.to_owned()))
+        .collect::<Vec<_>>();
+    if !missing_expressions.is_empty() {
+        table
+            .add_columns()
+            .transform(NewColumnTransform::SqlExpressions(missing_expressions))
+            .execute()
+            .await?;
+    }
+
+    let indices = table.list_indices().await?;
+    if !indices.iter().any(|index| {
+        index.index_type.to_string() == "BTREE"
+            && index.columns.iter().any(|column| column == "paper_id")
+    }) {
+        table
+            .create_index(&["paper_id"], Index::BTree(BTreeIndexBuilder::default()))
+            .execute()
+            .await?;
+    }
+    for column in ["chunked", "embedded"] {
+        if !indices.iter().any(|index| {
+            index.index_type.to_string().eq_ignore_ascii_case("bitmap")
+                && index.columns.iter().any(|indexed| indexed == column)
+        }) {
+            table
+                .create_index(&[column], Index::Bitmap(BitmapIndexBuilder::default()))
+                .execute()
+                .await?;
+        }
+    }
+    Ok(())
+}
+
+fn sql_string(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn pending_index_filter(model: &str) -> String {
+    format!(
+        "chunked IS NULL OR chunked = false OR embedded IS NULL OR embedded = false OR embedding_model IS NULL OR embedding_model != {}",
+        sql_string(model)
+    )
+}
+
+async fn update_paper_index_state(
+    table: &Table,
+    paper_id: &str,
+    fields: &[(&str, String)],
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let mut update = table
+        .update()
+        .only_if(format!("paper_id = {}", sql_string(paper_id)));
+    for (field, expression) in fields {
+        update = update.column(*field, expression.clone());
+    }
+    let result = update.execute().await?;
+    if result.rows_updated != 1 {
+        return Err(format!(
+            "expected to update one indexing-state row for paper {paper_id:?}, updated {}",
+            result.rows_updated
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn string_value(array: &dyn Array, row: usize) -> Result<Option<&str>, String> {
     if array.is_null(row) {
         return Ok(None);
@@ -1147,6 +1729,34 @@ fn string_value(array: &dyn Array, row: usize) -> Result<Option<&str>, String> {
         "Expected a UTF-8 string column, got {:?}",
         array.data_type()
     ))
+}
+
+fn string_at(
+    batch: &lancedb::arrow::arrow_array::RecordBatch,
+    column: &str,
+    row: usize,
+) -> Result<Option<String>, Box<dyn Error + Send + Sync>> {
+    let array = batch
+        .column_by_name(column)
+        .ok_or_else(|| std::io::Error::other(format!("missing column {column:?}")))?;
+    string_value(array.as_ref(), row)
+        .map(|value| value.map(str::to_owned))
+        .map_err(std::io::Error::other)
+        .map_err(Into::into)
+}
+
+fn optional_bool_value(
+    array: &dyn Array,
+    row: usize,
+) -> Result<Option<bool>, Box<dyn Error + Send + Sync>> {
+    if array.is_null(row) {
+        return Ok(None);
+    }
+    let values = array
+        .as_any()
+        .downcast_ref::<BooleanArray>()
+        .ok_or_else(|| std::io::Error::other("indexing state column must be Boolean"))?;
+    Ok(Some(values.value(row)))
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> (String, bool) {
@@ -1195,6 +1805,46 @@ fn internal_error(error: impl std::fmt::Display) -> McpError {
     McpError::internal_error(error.to_string(), None)
 }
 
+async fn index_job_events(
+    manager: IndexJobManager,
+    job_id: String,
+) -> Result<
+    Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>>,
+    axum::http::StatusCode,
+> {
+    let (initial, receiver) = manager
+        .subscribe(&job_id)
+        .await
+        .map_err(|_| axum::http::StatusCode::NOT_FOUND)?;
+    let updates = stream::unfold(
+        (Some(initial), receiver, job_id, false),
+        |(initial, mut receiver, job_id, finished)| async move {
+            if finished {
+                return None;
+            }
+            let progress = if let Some(initial) = initial {
+                initial
+            } else {
+                loop {
+                    match receiver.recv().await {
+                        Ok(progress) if progress.job_id == job_id => break progress,
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => return None,
+                    }
+                }
+            };
+            let finished = matches!(progress.state.as_str(), "complete" | "failed");
+            let data = serde_json::to_string(&progress)
+                .expect("serializing indexing progress cannot fail");
+            Some((
+                Ok(Event::default().event("progress").data(data)),
+                (None, receiver, job_id, finished),
+            ))
+        },
+    );
+    Ok(Sse::new(updates).keep_alive(KeepAlive::default()))
+}
+
 fn validate_embedding_ctx(ctx: usize) -> Result<usize, McpError> {
     if (1..=DEFAULT_EMBEDDING_CTX).contains(&ctx) {
         Ok(ctx)
@@ -1209,8 +1859,18 @@ fn validate_embedding_ctx(ctx: usize) -> Result<usize, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_EMBEDDING_CTX, SEARCH_SNIPPET_CHARS, search_excerpt, validate_embedding_ctx,
+        DEFAULT_EMBEDDING_CTX, SEARCH_SNIPPET_CHARS, ensure_indexing_state_fields,
+        pending_index_filter, search_excerpt, sql_string, update_paper_index_state,
+        validate_embedding_ctx,
     };
+    use lancedb::{
+        arrow::{
+            arrow_array::{RecordBatch, StringArray},
+            arrow_schema::{DataType, Field, Schema},
+        },
+        connect,
+    };
+    use std::sync::Arc;
 
     #[test]
     fn embedding_ctx_accepts_limits_and_rejects_out_of_range_values() {
@@ -1221,6 +1881,59 @@ mod tests {
         );
         assert!(validate_embedding_ctx(0).is_err());
         assert!(validate_embedding_ctx(DEFAULT_EMBEDDING_CTX + 1).is_err());
+    }
+
+    #[tokio::test]
+    async fn indexing_state_flags_are_filterable_and_updateable() {
+        let database = connect("memory://").execute().await.unwrap();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("paper_id", DataType::Utf8, false),
+            Field::new("text", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["paper-1"])),
+                Arc::new(StringArray::from(vec!["paper text"])),
+            ],
+        )
+        .unwrap();
+        let table = database
+            .create_table("paper_state_test", batch)
+            .execute()
+            .await
+            .unwrap();
+
+        ensure_indexing_state_fields(&table).await.unwrap();
+        update_paper_index_state(
+            &table,
+            "paper-1",
+            &[
+                ("chunked", "true".to_owned()),
+                ("embedded", "true".to_owned()),
+                ("embedding_model", sql_string("model-1")),
+                ("chunk_count", "3".to_owned()),
+                ("embedded_chunk_count", "3".to_owned()),
+                ("indexing_error", "NULL".to_owned()),
+            ],
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            table
+                .count_rows(Some("chunked = true".to_owned()))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            table
+                .count_rows(Some(pending_index_filter("model-1")))
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
