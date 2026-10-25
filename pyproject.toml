@@ -3,13 +3,19 @@ name = "lance-arxiv-tools"
 version = "0.1.0"
 description = "Optional Python embedding service for the local arXiv project"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "lancedb>=0.40.0",
+]
 
 [project.optional-dependencies]
 embedding = [
     "sentence-transformers>=5.1,<6",
     "transformers>=4.51.3,<5",
     "compressed-tensors>=0.12",
+]
+indexer = [
+    "pylance==13.0.0",
+    "torch>=2.0",
 ]
 
 [tool.uv]

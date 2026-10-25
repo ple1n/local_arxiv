@@ -17,7 +17,7 @@ use lancedb::{
     index::{
         Index,
         scalar::{BTreeIndexBuilder, BitmapIndexBuilder, FtsIndexBuilder, FullTextSearchQuery},
-        vector::IvfFlatIndexBuilder,
+        vector::IvfPqIndexBuilder,
     },
     query::{ExecutableQuery, QueryBase, Select},
     table::NewColumnTransform,
@@ -451,10 +451,10 @@ impl<'a> HybridPipeline<'a> {
             .into());
         }
         let indices = table.list_indices().await?;
-        if indices
-            .iter()
-            .any(|index| index.columns.iter().any(|column| column == &column_name))
-        {
+        if indices.iter().any(|index| {
+            index.index_type.to_string().eq_ignore_ascii_case("IVF_PQ")
+                && index.columns.iter().any(|column| column == &column_name)
+        }) {
             return Ok(());
         }
         eprintln!(
@@ -481,7 +481,7 @@ impl<'a> HybridPipeline<'a> {
         table
             .create_index(
                 &[column_name.as_str()],
-                Index::IvfFlat(IvfFlatIndexBuilder::default().distance_type(DistanceType::Cosine)),
+                Index::IvfPq(IvfPqIndexBuilder::default().distance_type(DistanceType::Cosine)),
             )
             .execute()
             .await?;
@@ -1235,9 +1235,10 @@ pub async fn abstract_vector_index_status(
                 .iter()
                 .any(|column| column == &readiness_column)
         });
-    let vector_index = indices
-        .iter()
-        .find(|index| index.columns.iter().any(|column| column == &vector_column));
+    let vector_index = indices.iter().find(|index| {
+        index.index_type.to_string().eq_ignore_ascii_case("IVF_PQ")
+            && index.columns.iter().any(|column| column == &vector_column)
+    });
     let embedded_vectors = if readiness_index_ready {
         table
             .count_rows(Some(format!("{readiness_column} = true")))
@@ -1359,16 +1360,16 @@ async fn ensure_vector_index_for_table(table: &Table, embedding_model: &str) -> 
         return Err(format!("no embeddings found in vector column {column_name:?}").into());
     }
     let indices = table.list_indices().await?;
-    if indices
-        .iter()
-        .any(|index| index.columns.iter().any(|column| column == &column_name))
-    {
+    if indices.iter().any(|index| {
+        index.index_type.to_string().eq_ignore_ascii_case("IVF_PQ")
+            && index.columns.iter().any(|column| column == &column_name)
+    }) {
         return Ok(());
     }
     table
         .create_index(
             &[column_name.as_str()],
-            Index::IvfFlat(IvfFlatIndexBuilder::default().distance_type(DistanceType::Cosine)),
+            Index::IvfPq(IvfPqIndexBuilder::default().distance_type(DistanceType::Cosine)),
         )
         .execute()
         .await?;
@@ -1514,8 +1515,9 @@ pub fn vector_column_name(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        HybridPipeline, TableNames, abstract_vector_index_status, embed_abstract_batch,
-        ensure_abstract_vector_index, vector_column_name,
+        DistanceType, HybridPipeline, Index, IvfPqIndexBuilder, TableNames,
+        abstract_vector_index_status, embed_abstract_batch, ensure_abstract_vector_index,
+        vector_column_name,
     };
     use crate::test_pipeline::{Embedder, EmbeddingTask, ModelFuture, PipelineResult, Reranker};
     use lancedb::{
@@ -1734,14 +1736,21 @@ mod tests {
             Field::new("paper_id", DataType::Utf8, false),
             Field::new("abstract", DataType::Utf8, true),
         ]));
+        let metadata_ids = (1..=17).map(|id| format!("paper-{id}")).collect::<Vec<_>>();
+        let metadata_abstracts = (1..=17)
+            .map(|id| {
+                Some(if id == 1 {
+                    "relevant scientific topic".to_owned()
+                } else {
+                    format!("unrelated topic {id}")
+                })
+            })
+            .collect::<Vec<_>>();
         let metadata_batch = RecordBatch::try_new(
             metadata_schema,
             vec![
-                Arc::new(StringArray::from(vec!["paper-1", "paper-2"])),
-                Arc::new(StringArray::from(vec![
-                    Some("relevant scientific topic"),
-                    Some("unrelated topic"),
-                ])),
+                Arc::new(StringArray::from(metadata_ids)),
+                Arc::new(StringArray::from(metadata_abstracts)),
             ],
         )?;
         let metadata = database
@@ -1780,7 +1789,7 @@ mod tests {
                 == 0
         );
         let abstract_schema = metadata.schema().await?;
-        assert_eq!(metadata.count_rows(None).await?, 2);
+        assert_eq!(metadata.count_rows(None).await?, 17);
         assert!(
             !abstract_schema
                 .fields()
@@ -1795,6 +1804,20 @@ mod tests {
         let before_index = abstract_vector_index_status(&metadata, "mock-embedding").await?;
         assert!(before_index.has_embeddings);
         assert!(!before_index.vector_index_ready);
+        let additional_papers = (2..=16)
+            .map(|id| (format!("paper-{id}"), format!("unrelated topic {id}")))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            embed_abstract_batch(
+                &metadata,
+                &additional_papers,
+                "mock-embedding",
+                32_768,
+                &MockEmbedder,
+            )
+            .await?,
+            15
+        );
         let pipeline = HybridPipeline::new(
             &database,
             TableNames {
@@ -1839,6 +1862,21 @@ mod tests {
                 .err()
                 .is_some_and(|error| error.to_string().contains("vector index is not ready"))
         );
+        let vector_column = vector_column_name("mock-embedding");
+        metadata
+            .create_index(
+                &[vector_column.as_str()],
+                Index::IvfPq(
+                    IvfPqIndexBuilder::default()
+                        .distance_type(DistanceType::Cosine)
+                        .num_partitions(1)
+                        .sample_rate(16)
+                        .num_sub_vectors(2)
+                        .num_bits(4),
+                ),
+            )
+            .execute()
+            .await?;
         ensure_abstract_vector_index(&metadata, "mock-embedding").await?;
         let result = pipeline
             .search_abstract(
@@ -1874,7 +1912,7 @@ mod tests {
         assert_eq!(
             embed_abstract_batch(
                 &metadata,
-                &[("paper-2".to_owned(), "unrelated topic".to_owned())],
+                &[("paper-17".to_owned(), "another unrelated topic".to_owned())],
                 "mock-embedding",
                 32_768,
                 &MockEmbedder,
@@ -1883,7 +1921,7 @@ mod tests {
             1
         );
         let after_upsert = abstract_vector_index_status(&metadata, "mock-embedding").await?;
-        assert_eq!(after_upsert.embedded_vectors, 2);
+        assert_eq!(after_upsert.embedded_vectors, 17);
         assert!(!after_upsert.vector_index_ready);
         assert_eq!(after_upsert.unindexed_vectors, 1);
         let vector_index = metadata

@@ -1,3 +1,4 @@
+use crate::python_indexer::{IndexBuildProgress, PythonIndexClient};
 use crate::test_pipeline::Embedder;
 use axum::{
     Json, Router,
@@ -16,7 +17,7 @@ use lancedb::{
         scalar::{BTreeIndexBuilder, BitmapIndexBuilder, FullTextSearchQuery},
     },
     query::{ExecutableQuery, QueryBase, Select},
-    table::{NewColumnTransform, OptimizeAction, OptimizeOptions},
+    table::NewColumnTransform,
 };
 use rmcp::{
     ErrorData as McpError, ServerHandler,
@@ -241,6 +242,13 @@ impl IndexJobManager {
                 "Cannot change pause state while indexing job is {}",
                 progress.state
             ));
+        }
+        if progress.phase.as_deref().is_some_and(|phase| {
+            phase.starts_with("Building full-text vector index")
+                || phase.starts_with("Building abstract vector index")
+                || phase.starts_with("GPU IVF-PQ:")
+        }) {
+            return Err("IVF-PQ index builds cannot be paused".to_owned());
         }
         self.paused.store(paused, Ordering::Release);
         progress.state = if paused { "paused" } else { "running" }.to_owned();
@@ -586,6 +594,7 @@ struct ArxivMcpServer {
     database_path: String,
     embedding_model: String,
     embedding_endpoint: String,
+    python_indexer: PythonIndexClient,
     model_list_endpoint: String,
     reranker_endpoint: String,
     embedding_tokenizer: Arc<Tokenizer>,
@@ -607,6 +616,7 @@ impl ArxivMcpServer {
         database_path: String,
         embedding: EmbeddingModelConfig,
         embedding_endpoint: String,
+        python_indexer_endpoint: String,
         model_list_endpoint: String,
         reranker_endpoint: String,
         embedding_tokenizer: Arc<Tokenizer>,
@@ -622,6 +632,7 @@ impl ArxivMcpServer {
             database_path,
             embedding_model: embedding.id,
             embedding_endpoint,
+            python_indexer: PythonIndexClient::new(python_indexer_endpoint),
             model_list_endpoint,
             reranker_endpoint,
             embedding_tokenizer,
@@ -642,6 +653,127 @@ impl ArxivMcpServer {
             self.embedding_scheduler.clone(),
         )
         .map_err(internal_error)
+    }
+
+    async fn build_gpu_vector_index(
+        &self,
+        table_name: &str,
+        column_name: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let job_id = self
+            .index_jobs
+            .current()
+            .await
+            .map(|job| job.job_id)
+            .unwrap_or_else(|| {
+                format!(
+                    "index-{}",
+                    NEXT_INDEX_JOB_ID.fetch_add(1, Ordering::Relaxed)
+                )
+            });
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+        let client = self.python_indexer.clone();
+        let database_path = self.database_path.clone();
+        let table_name = table_name.to_owned();
+        let column_name = column_name.to_owned();
+        let worker_job_id = job_id.clone();
+        let worker = tokio::spawn(async move {
+            client
+                .build_index(
+                    &worker_job_id,
+                    &database_path,
+                    &table_name,
+                    &column_name,
+                    progress_tx,
+                )
+                .await
+        });
+
+        while let Some(update) = progress_rx.recv().await {
+            self.update_index_build_progress(&job_id, update).await;
+        }
+        worker.await??;
+        Ok(())
+    }
+
+    async fn update_index_build_progress(&self, job_id: &str, update: IndexBuildProgress) {
+        if self
+            .index_jobs
+            .current()
+            .await
+            .is_some_and(|job| job.job_id == job_id)
+        {
+            self.index_jobs
+                .update(|progress| {
+                    progress.phase = Some(format!("GPU IVF-PQ: {}", update.stage));
+                    progress.phase_completed = update.completed.unwrap_or_default();
+                    progress.phase_total = update.total;
+                    if update.state == "failed" {
+                        progress.error = update.error;
+                    }
+                })
+                .await;
+        }
+    }
+
+    async fn ensure_gpu_vector_index(
+        &self,
+        table_name: &str,
+        embedding_model: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let column_name = crate::hybrid_pipeline::vector_column_name(embedding_model);
+        let database = connect(&self.database_path).execute().await?;
+        let table = database.open_table(table_name).execute().await?;
+        let schema = table.schema().await?;
+        schema.field_with_name(&column_name)?;
+        let vector_count = table
+            .count_rows(Some(format!("{column_name} IS NOT NULL")))
+            .await?;
+        if vector_count == 0 {
+            return Err(format!("no embeddings found in vector column {column_name:?}").into());
+        }
+        if table.list_indices().await?.iter().any(|index| {
+            index.index_type.to_string().eq_ignore_ascii_case("IVF_PQ")
+                && index.columns.iter().any(|column| column == &column_name)
+                && index
+                    .num_indexed_rows
+                    .and_then(|count| usize::try_from(count).ok())
+                    .is_some_and(|count| count >= vector_count)
+        }) {
+            return Ok(());
+        }
+
+        self.rebuild_gpu_vector_index(table_name, embedding_model)
+            .await
+    }
+
+    async fn rebuild_gpu_vector_index(
+        &self,
+        table_name: &str,
+        embedding_model: &str,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let column_name = crate::hybrid_pipeline::vector_column_name(embedding_model);
+        self.build_gpu_vector_index(table_name, &column_name)
+            .await?;
+        let refreshed_database = connect(&self.database_path).execute().await?;
+        let refreshed_table = refreshed_database.open_table(table_name).execute().await?;
+        let vector_count = refreshed_table
+            .count_rows(Some(format!("{column_name} IS NOT NULL")))
+            .await?;
+        if !refreshed_table.list_indices().await?.iter().any(|index| {
+            index.index_type.to_string().eq_ignore_ascii_case("IVF_PQ")
+                && index.columns.iter().any(|column| column == &column_name)
+                && index
+                    .num_indexed_rows
+                    .and_then(|count| usize::try_from(count).ok())
+                    .is_some_and(|count| count >= vector_count)
+        }) {
+            return Err(format!(
+                "Python indexer completed without covering all {vector_count} vectors in {column_name:?}"
+            )
+            .into());
+        }
+        Ok(())
     }
 
     fn chunk_embedding_text(
@@ -772,7 +904,6 @@ impl ArxivMcpServer {
                         indexed_model.as_deref(),
                         self.embedding_ctx,
                         token_budget,
-                        paper_id.is_some(),
                         true,
                     )
                     .await
@@ -839,13 +970,12 @@ impl ArxivMcpServer {
                     progress.current_paper = None;
                 })
                 .await;
-            let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
-                &database,
-                crate::hybrid_pipeline::TableNames {
-                    chunks: crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE.to_owned(),
-                },
-            );
-            pipeline.ensure_vector_index(&self.embedding_model).await?;
+            self.index_jobs.wait_until_resumed().await;
+            self.ensure_gpu_vector_index(
+                crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE,
+                &self.embedding_model,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -965,6 +1095,18 @@ impl ArxivMcpServer {
                 progress.failed_papers = failed_count;
             })
             .await;
+        if embedded_count > 0 {
+            self.index_jobs
+                .update(|progress| {
+                    progress.phase = Some("Building abstract vector index".to_owned());
+                })
+                .await;
+            self.index_jobs.wait_until_resumed().await;
+            let table_name =
+                env::var("ARXIV_METADATA_TABLE").unwrap_or_else(|_| "arxiv_metadata".to_owned());
+            self.ensure_gpu_vector_index(&table_name, &self.embedding_model)
+                .await?;
+        }
         Ok(())
     }
 
@@ -1014,7 +1156,7 @@ impl ArxivMcpServer {
             )?;
             let model = string_at(&batch, "embedding_model", 0)?;
             let database = connect(&self.database_path).execute().await?;
-            return self
+            let result = self
                 .process_paper(
                     &database,
                     &id,
@@ -1024,10 +1166,17 @@ impl ArxivMcpServer {
                     model.as_deref(),
                     ctx,
                     token_budget,
-                    true,
                     false,
                 )
-                .await;
+                .await?;
+            if result.1 {
+                self.ensure_gpu_vector_index(
+                    crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE,
+                    &self.embedding_model,
+                )
+                .await?;
+            }
+            return Ok(result);
         }
         Err(format!("No paper found with paper_id {paper_id:?}").into())
     }
@@ -1042,7 +1191,6 @@ impl ArxivMcpServer {
         indexed_model: Option<&str>,
         ctx: usize,
         token_budget: usize,
-        finalize_index: bool,
         pauseable: bool,
     ) -> Result<(usize, bool), Box<dyn Error + Send + Sync>> {
         let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
@@ -1149,21 +1297,15 @@ impl ArxivMcpServer {
         self.index_jobs
             .update(|progress| progress.phase = Some("embedding chunks".to_owned()))
             .await;
-        let embedding = if finalize_index {
-            pipeline
-                .embed_paper_chunks(paper_id, &self.embedding_model, ctx, &job_embedder, 4)
-                .await
-        } else {
-            pipeline
-                .embed_paper_chunks_without_index(
-                    paper_id,
-                    &self.embedding_model,
-                    ctx,
-                    &job_embedder,
-                    4,
-                )
-                .await
-        };
+        let embedding = pipeline
+            .embed_paper_chunks_without_index(
+                paper_id,
+                &self.embedding_model,
+                ctx,
+                &job_embedder,
+                4,
+            )
+            .await;
         match embedding {
             Ok(_) => {
                 let (chunk_count, embedded_count) = pipeline
@@ -1517,36 +1659,16 @@ impl ArxivMcpServer {
             return serde_json::to_string(&status).map_err(internal_error);
         }
 
-        let vector_column = crate::hybrid_pipeline::vector_column_name(model);
-        let indices = self
-            .metadata_table
-            .list_indices()
+        let started_at = Instant::now();
+        eprintln!(
+            "[abstract-vector-index] GPU IVF-PQ build started model={model:?} embedded={} unindexed={}",
+            status.embedded_vectors, status.unindexed_vectors
+        );
+        let table_name =
+            env::var("ARXIV_METADATA_TABLE").unwrap_or_else(|_| "arxiv_metadata".to_owned());
+        self.ensure_gpu_vector_index(&table_name, model)
             .await
             .map_err(internal_error)?;
-        let vector_index = indices
-            .iter()
-            .find(|index| index.columns.iter().any(|column| column == &vector_column));
-        let started_at = Instant::now();
-        if let Some(index) = vector_index {
-            eprintln!(
-                "[abstract-vector-index] optimize started model={model:?} index={} embedded={} unindexed={}",
-                index.name, status.embedded_vectors, status.unindexed_vectors
-            );
-            self.metadata_table
-                .optimize(OptimizeAction::Index(
-                    OptimizeOptions::new().index_names(vec![index.name.clone()]),
-                ))
-                .await
-                .map_err(internal_error)?;
-        } else {
-            eprintln!(
-                "[abstract-vector-index] build started model={model:?} column={vector_column} embedded={}",
-                status.embedded_vectors
-            );
-            crate::hybrid_pipeline::ensure_abstract_vector_index(&self.metadata_table, model)
-                .await
-                .map_err(internal_error)?;
-        }
         let final_status =
             crate::hybrid_pipeline::abstract_vector_index_status(&self.metadata_table, model)
                 .await
@@ -1986,18 +2108,7 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        let database = connect(&self.database_path)
-            .execute()
-            .await
-            .map_err(internal_error)?;
-        let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
-            &database,
-            crate::hybrid_pipeline::TableNames {
-                chunks: table_name.to_owned(),
-            },
-        );
-        pipeline
-            .ensure_vector_index(&args.model)
+        self.ensure_gpu_vector_index(table_name, &args.model)
             .await
             .map_err(internal_error)?;
         serde_json::to_string(&serde_json::json!({
@@ -2061,6 +2172,25 @@ impl ArxivMcpServer {
                 None,
             ));
         }
+        let metadata_table_name =
+            env::var("ARXIV_METADATA_TABLE").unwrap_or_else(|_| "arxiv_metadata".to_owned());
+        if mode == "abstract" {
+            let status = crate::hybrid_pipeline::abstract_vector_index_status(
+                &self.metadata_table,
+                embedding_model,
+            )
+            .await
+            .map_err(internal_error)?;
+            if status.has_embeddings && !status.vector_index_ready {
+                self.ensure_gpu_vector_index(&metadata_table_name, embedding_model)
+                    .await
+                    .map_err(internal_error)?;
+            }
+        } else {
+            self.ensure_gpu_vector_index(table_name, embedding_model)
+                .await
+                .map_err(internal_error)?;
+        }
 
         let database = connect(&self.database_path)
             .execute()
@@ -2085,7 +2215,7 @@ impl ArxivMcpServer {
             pipeline
                 .search_abstract(
                     &self.table,
-                    "arxiv_metadata",
+                    &metadata_table_name,
                     query,
                     embedding_model,
                     reranker,
@@ -2356,6 +2486,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             "http://{}/v1/embeddings",
             SocketAddr::new(config.llama.host, config.llama.port)
         ),
+        format!("http://127.0.0.1:{}", config.embedding.port),
         format!(
             "http://{}/v1/models",
             SocketAddr::new(config.llama.host, config.llama.port)
@@ -2794,6 +2925,16 @@ mod tests {
         let jobs = IndexJobManager::new();
         let job_id = jobs.start(None, 1).await.unwrap();
         jobs.update(|progress| progress.state = "running".to_owned())
+            .await;
+        jobs.update(|progress| progress.phase = Some("Building full-text vector index".to_owned()))
+            .await;
+        assert!(
+            jobs.set_paused(&job_id, true)
+                .await
+                .unwrap_err()
+                .contains("cannot be paused")
+        );
+        jobs.update(|progress| progress.phase = Some("embedding chunks".to_owned()))
             .await;
         jobs.set_paused(&job_id, true).await.unwrap();
 

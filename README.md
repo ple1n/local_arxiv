@@ -219,11 +219,26 @@ hf download LiquidAI/LFM2.5-Embedding-350M tokenizer.json \
   --local-dir /b/models/LFM2.5-Embedding-350M
 ```
 
-`embedding_server.py` is a separate optional Python service and is not used by
-the Rust embedding or reranking pipeline. Do not start it for the LFM setup.
-The `embedding` config entry only remains for that standalone service. The
-chunk-test `ctx` argument defaults to 32K, but local LFM tokenization caps each
-input at the configured model maximum. `list_models` exposes the configured
-LFM embedding model and discovers reranking models from llama-server; set
-`MODEL_LIST_URL` only when the `/v1/models` endpoint is hosted elsewhere.
-`RERANK_API_KEY` can provide bearer authentication when required.
+The Rust backend uses `embedding_server.py` only for CUDA IVF-PQ index builds;
+the browser never calls this service. Start it with the `indexer` extra so the
+Python worker can open the existing Lance dataset and report build progress to
+the backend, which relays it through the existing indexing-job event stream:
+
+```sh
+uv run --extra indexer python embedding_server.py
+```
+
+The worker requires CUDA and fails rather than silently building the index on
+the CPU. The optional `/embed` endpoint still uses Sentence Transformers; its
+`embedding` extra is needed only when that endpoint is used, and the model is
+loaded lazily so index-only runs do not reserve GPU memory for it. The Rust
+embedding and reranking pipeline remain unchanged. The chunk-test `ctx`
+argument defaults to 32K, but local LFM tokenization caps each input at the
+configured model maximum. `list_models` exposes the configured LFM embedding
+model and discovers reranking models from llama-server; set `MODEL_LIST_URL`
+only when the `/v1/models` endpoint is hosted elsewhere. `RERANK_API_KEY` can
+provide bearer authentication when required.
+
+Pausing an indexing job pauses embedding batches. An IVF-PQ build already in
+progress is not interruptible; the backend rejects pause requests during that
+phase rather than reporting a paused job while GPU work continues.
