@@ -74,7 +74,9 @@ def _progress_fields(progress: Any) -> tuple[str, int | None, int | None]:
     return stage, None, None
 
 
-def _push_index_progress(callback_url: str, progress: dict[str, Any]) -> None:
+def _push_index_progress(
+    callback_url: str, progress: dict[str, Any], *, attempts: int = 5
+) -> None:
     payload = json.dumps(progress, separators=(",", ":")).encode("utf-8")
     request = Request(
         callback_url,
@@ -83,7 +85,7 @@ def _push_index_progress(callback_url: str, progress: dict[str, Any]) -> None:
         method="POST",
     )
     last_error: Exception | None = None
-    for attempt in range(5):
+    for attempt in range(attempts):
         try:
             with urlopen(request, timeout=5) as response:
                 if not 200 <= response.status < 300:
@@ -91,7 +93,7 @@ def _push_index_progress(callback_url: str, progress: dict[str, Any]) -> None:
             return
         except Exception as exc:
             last_error = exc
-            if attempt < 4:
+            if attempt + 1 < attempts:
                 time.sleep(0.2 * (2**attempt))
     raise RuntimeError(f"could not push index progress to Rust backend: {last_error}")
 
@@ -167,22 +169,27 @@ def _writable_lance_to_tensor(
 
 
 def _make_quantizer_progress_tqdm(
-    job_id: str, num_sub_vectors: int, original_tqdm: Any
+    job_id: str, num_sub_vectors: int, callback_url: str, original_tqdm: Any
 ) -> Any:
     fit_count = 0
     completed_iterations = 0
+    tracking_quantizer = False
 
     def tracked_tqdm(iterable: Any, *args: Any, **kwargs: Any) -> Any:
-        nonlocal fit_count, completed_iterations
+        nonlocal fit_count, completed_iterations, tracking_quantizer
         with index_jobs_lock:
-            in_quantizer = (
+            tracking_quantizer = tracking_quantizer or (
                 index_jobs.get(job_id, {}).get("stage") == "train_quantizer"
             )
         try:
             iteration_count = len(iterable)
         except TypeError:
             iteration_count = 0
-        if not in_quantizer or iteration_count != 50:
+        if (
+            not tracking_quantizer
+            or fit_count >= num_sub_vectors
+            or iteration_count != 50
+        ):
             return original_tqdm(iterable, *args, **kwargs)
 
         fit_count += 1
@@ -194,6 +201,7 @@ def _make_quantizer_progress_tqdm(
             for iteration in original_tqdm(iterable, *args, **kwargs):
                 yield iteration
                 completed_iterations += 1
+                snapshot = None
                 with index_jobs_lock:
                     job = index_jobs.get(job_id)
                     if job is not None:
@@ -203,6 +211,21 @@ def _make_quantizer_progress_tqdm(
                                 "completed": completed_iterations,
                                 "total": num_sub_vectors * 50,
                             }
+                        )
+                        snapshot = dict(job)
+                if (
+                    snapshot is not None
+                    and (
+                        completed_iterations % max(1, num_sub_vectors) == 0
+                        or completed_iterations == num_sub_vectors * 50
+                    )
+                ):
+                    try:
+                        _push_index_progress(callback_url, snapshot, attempts=1)
+                    except Exception as exc:
+                        print(
+                            f"Could not push IVF-PQ quantizer progress for job {job_id}: {exc}",
+                            flush=True,
                         )
 
         return report_iterations()
@@ -398,7 +421,12 @@ def _run_index_job(
 
         original_tqdm = lance_kmeans.tqdm
         lance_kmeans.tqdm = _make_quantizer_progress_tqdm(
-            job_id, num_sub_vectors, original_tqdm
+            job_id, num_sub_vectors, callback_url, original_tqdm
+        )
+        print(
+            f"IVF-PQ index job {job_id} starting Lance training, assignment, "
+            f"index assembly, and commit",
+            flush=True,
         )
         with gpu_lock:
             try:

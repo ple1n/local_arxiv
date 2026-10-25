@@ -489,6 +489,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
     useState<AbstractEmbeddingIndexStatus | null>(null);
   const [abstractIndexBusy, setAbstractIndexBusy] = useState(false);
   const [abstractIndexError, setAbstractIndexError] = useState("");
+  const [abstractIndexMessage, setAbstractIndexMessage] = useState("");
   const [selectedRerankerModel, setSelectedRerankerModel] = useState("");
   const [embeddingMode, setEmbeddingMode] = useState<EmbeddingMode>("abstract");
   const [tokenBudget, setTokenBudget] = useState(480);
@@ -694,6 +695,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
     if (!client || !selectedEmbeddingModel || abstractIndexBusy || embeddingBusy) return;
     setAbstractIndexBusy(true);
     setAbstractIndexError("");
+    setAbstractIndexMessage("");
     try {
       const response = await client.callTool({
         name: "build_abstract_vector_index",
@@ -704,7 +706,11 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       ) as AbstractEmbeddingIndexStatus;
       setAbstractEmbeddingIndexStatus(builtStatus);
       await refreshAbstractEmbeddingIndexStatus(selectedEmbeddingModel);
+      setAbstractIndexMessage(
+        `IVF-PQ index build completed and verified for ${builtStatus.embedding_model}.`,
+      );
     } catch (reason) {
+      setAbstractIndexMessage("");
       setAbstractIndexError(
         reason instanceof Error ? reason.message : String(reason),
       );
@@ -1184,6 +1190,9 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             )}
           {abstractIndexError && (
             <span role="alert">{abstractIndexError}</span>
+          )}
+          {abstractIndexMessage && (
+            <span role="status">{abstractIndexMessage}</span>
           )}
         </div>
         {abstractEmbeddingIndexStats.length > 0 && (

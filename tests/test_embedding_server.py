@@ -28,14 +28,18 @@ class ProductQuantizationTests(unittest.TestCase):
     def test_quantizer_iterations_update_job_progress(self):
         job_id = "quantizer-progress-test"
         embedding_server.index_jobs[job_id] = {"stage": "train_quantizer"}
-        report = embedding_server._make_quantizer_progress_tqdm(
-            job_id, 64, lambda iterable, **kwargs: iterable
-        )
+        with patch.object(embedding_server, "_push_index_progress") as push:
+            report = embedding_server._make_quantizer_progress_tqdm(
+                job_id, 10, "http://backend/progress", lambda iterable, **kwargs: iterable
+            )
 
-        self.assertEqual(list(report(range(50))), list(range(50)))
-        self.assertEqual(embedding_server.index_jobs[job_id]["stage"], "PQ codebook 1/64")
-        self.assertEqual(embedding_server.index_jobs[job_id]["completed"], 50)
-        self.assertEqual(embedding_server.index_jobs[job_id]["total"], 3200)
+            for _ in range(10):
+                self.assertEqual(list(report(range(50))), list(range(50)))
+            self.assertEqual(push.call_count, 50)
+            self.assertEqual(push.call_args_list[-1].args[1]["completed"], 500)
+        self.assertEqual(embedding_server.index_jobs[job_id]["stage"], "PQ codebook 10/10")
+        self.assertEqual(embedding_server.index_jobs[job_id]["completed"], 500)
+        self.assertEqual(embedding_server.index_jobs[job_id]["total"], 500)
         del embedding_server.index_jobs[job_id]
 
     def test_subvector_count_matches_lance_dimension_defaults(self):

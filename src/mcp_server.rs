@@ -733,11 +733,23 @@ impl ArxivMcpServer {
             self.python_indexer
                 .start_index(&job_id, &self.database_path, table_name, column_name)
                 .await?;
+            let mut last_stage = String::new();
             loop {
                 let update = progress.recv().await.map_err(|error| {
                     std::io::Error::other(format!("Python index progress stream failed: {error}"))
                 })?;
                 let state = update.state.clone();
+                if update.stage != last_stage {
+                    eprintln!(
+                        "[gpu-vector-index] progress state={} job_id={} stage={:?} completed={:?} total={:?}",
+                        update.state,
+                        update.job_id,
+                        update.stage,
+                        update.completed,
+                        update.total
+                    );
+                    last_stage.clone_from(&update.stage);
+                }
                 self.update_index_build_progress(&job_id, update.clone())
                     .await;
                 match state.as_str() {
