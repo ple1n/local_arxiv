@@ -1,4 +1,6 @@
+use futures::StreamExt;
 use lancedb::{
+    DistanceType,
     arrow::{
         arrow_array::{
             Array, FixedSizeListArray, Float32Array, RecordBatch, RecordBatchIterator, StringArray,
@@ -9,20 +11,22 @@ use lancedb::{
     index::{Index, vector::IvfFlatIndexBuilder},
     query::{ExecutableQuery, QueryBase, Select},
     table::NewColumnTransform,
-    DistanceType,
 };
-use futures::StreamExt;
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = connect("memory://").execute().await?;
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("paper_id", DataType::Utf8, false),
-    ]));
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "paper_id",
+        DataType::Utf8,
+        false,
+    )]));
     let ids = RecordBatch::try_new(
         schema.clone(),
-        vec![Arc::new(StringArray::from(vec!["paper-1", "paper-2", "paper-3"]))],
+        vec![Arc::new(StringArray::from(vec![
+            "paper-1", "paper-2", "paper-3",
+        ]))],
     )?;
     let table = db
         .create_table("vector_schema_churn", vec![ids])
@@ -31,10 +35,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for generation in 0..3 {
         let column = format!("embedding_model_{generation}");
-        let vector_type = DataType::FixedSizeList(
-            Arc::new(Field::new("item", DataType::Float32, true)),
-            2,
-        );
+        let vector_type =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 2);
         table
             .add_columns()
             .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
@@ -47,9 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let vectors = Arc::new(FixedSizeListArray::try_new(
             item_field,
             2,
-            Arc::new(Float32Array::from(vec![
-                1.0, 0.0, 0.0, 1.0, 0.7, 0.7,
-            ])),
+            Arc::new(Float32Array::from(vec![1.0, 0.0, 0.0, 1.0, 0.7, 0.7])),
             None,
         )?);
         let batch = RecordBatch::try_new(
@@ -64,27 +64,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let mut merge = table.merge_insert(&["paper_id"]);
         merge.when_matched_update_all(None);
-        merge.execute(Box::new(RecordBatchIterator::new(
-            vec![Ok(batch)].into_iter(),
-            Arc::new(Schema::new(vec![
-                Field::new("paper_id", DataType::Utf8, false),
-                Field::new(
-                    &column,
-                    DataType::FixedSizeList(
-                        Arc::new(Field::new("item", DataType::Float32, true)),
-                        2,
+        merge
+            .execute(Box::new(RecordBatchIterator::new(
+                vec![Ok(batch)].into_iter(),
+                Arc::new(Schema::new(vec![
+                    Field::new("paper_id", DataType::Utf8, false),
+                    Field::new(
+                        &column,
+                        DataType::FixedSizeList(
+                            Arc::new(Field::new("item", DataType::Float32, true)),
+                            2,
+                        ),
+                        true,
                     ),
-                    true,
-                ),
-            ])),
-        ))).await?;
+                ])),
+            )))
+            .await?;
 
         table
             .create_index(
                 &[column.as_str()],
-                Index::IvfFlat(
-                    IvfFlatIndexBuilder::default().distance_type(DistanceType::Cosine),
-                ),
+                Index::IvfFlat(IvfFlatIndexBuilder::default().distance_type(DistanceType::Cosine)),
             )
             .execute()
             .await?;
@@ -96,11 +96,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         table.drop_index(&index.name).await?;
         table.drop_columns(&[column.as_str()]).await?;
         verify_rows(&table).await?;
-        println!("generation {generation}: added vector column, indexed, dropped index, dropped column");
+        println!(
+            "generation {generation}: added vector column, indexed, dropped index, dropped column"
+        );
     }
     println!(
         "final columns: {:?}",
-        table.schema().await?.fields().iter().map(|field| field.name()).collect::<Vec<_>>()
+        table
+            .schema()
+            .await?
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect::<Vec<_>>()
     );
     verify_rows(&table).await?;
     println!("final data read verified: all 3 paper IDs remain intact");

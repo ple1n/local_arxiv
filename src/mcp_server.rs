@@ -30,6 +30,7 @@ use rmcp::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     env,
     error::Error,
     net::{IpAddr, SocketAddr},
@@ -78,6 +79,8 @@ struct IndexJobProgress {
     error: Option<String>,
     #[serde(skip_serializing)]
     started_at: Instant,
+    #[serde(skip_serializing)]
+    embedding_completions: VecDeque<(Instant, usize)>,
 }
 
 #[derive(Clone)]
@@ -135,6 +138,7 @@ impl IndexJobManager {
             phase: Some("queued".to_owned()),
             error: None,
             started_at: Instant::now(),
+            embedding_completions: VecDeque::new(),
         };
         self.paused.store(false, Ordering::Release);
         *self.progress.write().await = Some(initial.clone());
@@ -146,11 +150,29 @@ impl IndexJobManager {
         if let Some(progress) = self.progress.write().await.as_mut() {
             update(progress);
             progress.elapsed_seconds = progress.started_at.elapsed().as_secs_f64();
-            progress.papers_per_second = if progress.elapsed_seconds > 0.0 {
-                progress.scanned_papers as f64 / progress.elapsed_seconds
-            } else {
-                0.0
-            };
+            let now = Instant::now();
+            while progress
+                .embedding_completions
+                .front()
+                .is_some_and(|(completed_at, _)| {
+                    now.duration_since(*completed_at) > Duration::from_secs(30)
+                })
+            {
+                progress.embedding_completions.pop_front();
+            }
+            let recent_completed: usize = progress
+                .embedding_completions
+                .iter()
+                .map(|(_, count)| count)
+                .sum();
+            progress.papers_per_second = progress
+                .embedding_completions
+                .front()
+                .map(|(first, _)| {
+                    let elapsed = now.duration_since(*first).as_secs_f64().max(1.0);
+                    recent_completed as f64 / elapsed
+                })
+                .unwrap_or(0.0);
             progress.eta_seconds = if progress.total_papers_known
                 && progress.scanned_papers < progress.total_papers
                 && progress.papers_per_second > 0.0
@@ -166,6 +188,17 @@ impl IndexJobManager {
                 None
             };
             let _ = self.updates.send(progress.clone());
+        }
+    }
+
+    async fn record_embedding_completion(&self, papers: usize) {
+        if papers == 0 {
+            return;
+        }
+        if let Some(progress) = self.progress.write().await.as_mut() {
+            progress
+                .embedding_completions
+                .push_back((Instant::now(), papers));
         }
     }
 
@@ -245,6 +278,14 @@ impl IndexJobManager {
             .ok_or_else(|| format!("No indexing job found with ID {job_id:?}"))?;
         Ok((current, receiver))
     }
+
+    async fn current(&self) -> Option<IndexJobProgress> {
+        self.progress
+            .read()
+            .await
+            .clone()
+            .filter(|progress| matches!(progress.state.as_str(), "queued" | "running" | "paused"))
+    }
 }
 
 struct JobPausableEmbedder<'a> {
@@ -266,17 +307,10 @@ impl Embedder for JobPausableEmbedder<'_> {
         Box::pin(async move {
             if let Some(jobs) = self.jobs {
                 jobs.wait_until_resumed().await;
-                jobs.update(|progress| {
-                    progress.phase = Some("Waiting for embedding service".to_owned());
-                })
-                .await;
             }
             let vectors = self.inner.embed(texts, task, ctx).await?;
             if let Some(jobs) = self.jobs {
-                jobs.update(|progress| {
-                    progress.phase = Some("Persisting embedding vectors".to_owned());
-                })
-                .await;
+                jobs.record_embedding_completion(texts.len()).await;
             }
             Ok(vectors)
         })
@@ -796,30 +830,10 @@ impl ArxivMcpServer {
 
     async fn run_abstract_index_job(
         &self,
-        database: &lancedb::Connection,
+        _database: &lancedb::Connection,
         paper_id: Option<String>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.index_jobs
-            .update(|progress| {
-                progress.phase = Some("Preparing abstract table".to_owned());
-            })
-            .await;
-        let table = crate::hybrid_pipeline::ensure_abstract_table_with_progress(
-            database,
-            &self.metadata_table,
-            |completed, total| async move {
-                self.index_jobs.wait_until_resumed().await;
-                self.index_jobs
-                    .update(|progress| {
-                        progress.phase = Some("Preparing abstract table".to_owned());
-                        progress.phase_completed = completed;
-                        progress.phase_total = Some(total);
-                    })
-                    .await;
-                Ok(())
-            },
-        )
-        .await?;
+        let table = &self.metadata_table;
         self.index_jobs
             .update(|progress| {
                 progress.phase = Some("Counting pending abstracts".to_owned());
@@ -865,41 +879,42 @@ impl ArxivMcpServer {
         let mut embedded_count = 0;
         let mut failed_count = 0;
         let mut last_progress_update = Instant::now();
+        const EMBEDDING_BATCH_SIZE: usize = 32;
         while let Some(batch) = rows.next().await {
             let batch = batch?;
+            let mut papers = Vec::new();
             for row in 0..batch.num_rows() {
-                self.index_jobs.wait_until_resumed().await;
                 let id = string_at(&batch, "paper_id", row)?
                     .ok_or("abstract row has a null paper_id")?;
+                let abstract_text = string_at(&batch, "abstract", row)?.unwrap_or_default();
+                papers.push((id, abstract_text));
+            }
+            for group in papers.chunks(EMBEDDING_BATCH_SIZE) {
+                self.index_jobs.wait_until_resumed().await;
+                let current = group.last().map(|(id, _)| id.clone());
                 self.index_jobs
-                    .update(|progress| {
-                        progress.current_paper = Some(id.clone());
-                        progress.phase = Some("embedding abstract".to_owned());
-                    })
+                    .update(|progress| progress.phase = Some("embedding abstracts".to_owned()))
                     .await;
-                match crate::hybrid_pipeline::embed_abstract_paper(
-                    database,
-                    &id,
+                match crate::hybrid_pipeline::embed_abstract_batch(
+                    table,
+                    group,
                     &self.embedding_model,
                     self.embedding_ctx,
                     &job_embedder,
                 )
                 .await
                 {
-                    Ok(true) => embedded_count += 1,
-                    Ok(false) => {}
+                    Ok(count) => embedded_count += count,
                     Err(error) => {
-                        failed_count += 1;
-                        eprintln!("Abstract embedding failed for {id}: {error}");
+                        failed_count += group.len();
+                        eprintln!("Abstract batch embedding failed: {error}");
                         self.index_jobs
-                            .update(|progress| {
-                                progress.error = Some(format!("{id}: {error}"));
-                            })
+                            .update(|progress| progress.error = Some(error.to_string()))
                             .await;
                     }
                 }
-                scanned += 1;
-                if scanned % 100 == 0
+                scanned += group.len();
+                if scanned % 100 < EMBEDDING_BATCH_SIZE
                     || paper_id.is_some()
                     || last_progress_update.elapsed().as_secs_f64() >= 1.0
                 {
@@ -909,7 +924,7 @@ impl ArxivMcpServer {
                             progress.chunked_papers = 0;
                             progress.embedded_papers = embedded_count;
                             progress.failed_papers = failed_count;
-                            progress.current_paper = Some(id);
+                            progress.current_paper = current;
                         })
                         .await;
                     last_progress_update = Instant::now();
@@ -938,7 +953,7 @@ impl ArxivMcpServer {
                     progress.current_paper = None;
                 })
                 .await;
-            crate::hybrid_pipeline::ensure_abstract_vector_index(database, &self.embedding_model)
+            crate::hybrid_pipeline::ensure_abstract_vector_index(table, &self.embedding_model)
                 .await?;
         }
         Ok(())
@@ -1791,7 +1806,7 @@ impl ArxivMcpServer {
             pipeline
                 .search_abstract(
                     &self.table,
-                    crate::hybrid_pipeline::GLOBAL_ABSTRACT_TABLE,
+                    "arxiv_metadata",
                     query,
                     embedding_model,
                     reranker,
@@ -2083,8 +2098,16 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         );
     let runtime_config = config.clone();
     let event_jobs = index_jobs.clone();
+    let current_jobs = index_jobs.clone();
     let router = Router::new()
         .route("/health", axum::routing::get(|| async { "ok" }))
+        .route(
+            "/indexing-jobs/current",
+            get(move || {
+                let manager = current_jobs.clone();
+                async move { Json(manager.current().await) }
+            }),
+        )
         .route(
             "/indexing-jobs/{job_id}/events",
             get(move |Path(job_id): Path<String>| {
@@ -2109,6 +2132,10 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
                 .expose_headers([HeaderName::from_static("mcp-session-id")]),
         );
     let listener = tokio::net::TcpListener::bind(bind_address).await?;
+    println!(
+        "ArXiv search UI available at http://{}/",
+        listener.local_addr()?
+    );
     println!(
         "ArXiv MCP server listening at http://{}/mcp (database: {database_path})",
         listener.local_addr()?
@@ -2431,6 +2458,23 @@ mod tests {
         let (reconnected, _) = jobs.subscribe(&job_id).await.unwrap();
         assert_eq!(reconnected.state, "complete");
         assert!(jobs.start(None, 0).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn eta_is_available_after_one_embedding_sample() {
+        let jobs = IndexJobManager::new();
+        jobs.start(None, 10).await.unwrap();
+        jobs.update(|progress| {
+            progress.state = "running".to_owned();
+            progress.total_papers_known = true;
+            progress.scanned_papers = 1;
+        })
+        .await;
+        jobs.record_embedding_completion(1).await;
+        jobs.update(|_| {}).await;
+        let progress = jobs.progress.read().await.clone().unwrap();
+        assert!(progress.papers_per_second > 0.0);
+        assert!(progress.eta_seconds.is_some());
     }
 
     #[tokio::test]

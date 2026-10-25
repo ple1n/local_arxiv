@@ -119,8 +119,8 @@ queues pending papers according to the selected embedding mode; the reader's
 **index** button queues the selected paper. Abstract-only mode is selected by
 default. Full-text mode indexes
 papers not marked chunked and embedded in the main text table. Abstract mode
-uses null vectors in `arxiv_abstracts` as the pending-work marker, with one row
-per paper and no chunk/status fields. The Web UI's **Embedding mode** selector
+adds model-specific vector columns directly to `arxiv_metadata`; null vectors
+mark pending papers, with no extra status fields. The Web UI's **Embedding mode** selector
 controls both indexing and hybrid dense search; changing modes never changes
 the full-text BM25 search path.
 
@@ -136,7 +136,7 @@ its whole batch as failed. The vector index is finalized after the job.
 The query button uses LanceDB BM25 full-text search and vector search over the
 global chunk table in full-text mode, fusing the two ranked lists with RRF
 (constant 60). In abstract mode, the same full-text BM25 results are fused by
-`paper_id` with dense results from `arxiv_abstracts`, also using RRF 60. Abstract
+`paper_id` with dense results from model-specific vectors in `arxiv_metadata`, also using RRF 60. Abstract
 mode uses the main paper-text BM25 index, without requiring chunk indexing. Both
 paths optionally rerank the fused candidates. The one-paper test and corpus job share
 the same durable state transitions, chunk table, embedding adapter, and index
@@ -147,10 +147,10 @@ The text and metadata live in separate LanceDB tables with native columns,
 linked by `paper_id`. Full-text search is indexed on `text`; the metadata table
 has a B-tree index on `paper_id`. Metadata is looked up by ID and added to the
 MCP response; it is not concatenated into a stored blob. Abstract vectors use a
-separate `arxiv_abstracts` table with `paper_id`, `abstract`, and nullable
-model-specific vector columns. It is initialized from metadata on first use;
-null vector values mean pending, and indexing progress is derived from vector
-presence rather than extra status fields.
+the metadata table stores model-specific abstract-vector columns alongside its
+existing fields. Abstract text remains sourced from metadata, so it is not
+duplicated. Null vector values mean pending, and indexing progress is derived
+from vector presence rather than extra status fields.
 
 The MCP tools only see data already present in the selected LanceDB tables.
 Sample-scale and full-corpus ingestion use the same table names and shared

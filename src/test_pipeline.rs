@@ -167,14 +167,40 @@ fn prepare_embedding_input(
 ) -> PipelineResult<String> {
     let prefixed = format!("{}{text}", task.prefix());
     let encoding = tokenizer.encode(prefixed.as_str(), true)?;
-    let token_count = encoding.get_ids().len();
-    if token_count > max_tokens {
+    if encoding.get_ids().len() <= max_tokens {
+        return Ok(prefixed);
+    }
+
+    const TRUNCATED_MARKER: &str = " [TRUNCATED]";
+    let prefix = task.prefix();
+    let prefix_tokens = tokenizer.encode(prefix, true)?.get_ids().len();
+    let marker = tokenizer.encode(TRUNCATED_MARKER, true)?;
+    let reserved = marker.get_ids().len();
+    if prefix_tokens + reserved >= max_tokens {
         return Err(format!(
-            "embedding input is {token_count} tokens, exceeding the safe limit of {max_tokens}; split the text into smaller chunks"
+            "safe embedding limit {max_tokens} is too small for the truncation marker"
         )
         .into());
     }
-    Ok(prefixed)
+
+    let content = &encoding.get_ids()[prefix_tokens..];
+    let mut keep = max_tokens - prefix_tokens - reserved;
+    loop {
+        let ids = &content[..keep.min(content.len())];
+        let decoded = tokenizer.decode(ids, true)?;
+        let candidate = format!("{prefix}{decoded}{TRUNCATED_MARKER}");
+        let candidate_encoding = tokenizer.encode(candidate.as_str(), true)?;
+        if candidate_encoding.get_ids().len() <= max_tokens {
+            return Ok(candidate);
+        }
+        if keep == 0 {
+            return Err(format!(
+                "could not fit truncation marker within safe embedding limit {max_tokens}"
+            )
+            .into());
+        }
+        keep -= 1;
+    }
 }
 
 #[derive(Clone)]

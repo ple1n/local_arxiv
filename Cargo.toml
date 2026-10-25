@@ -2,6 +2,7 @@
 name = "lance_arxiv"
 version = "0.1.0"
 edition = "2024"
+default-run = "lance_arxiv"
 
 [dependencies]
 lancedb = { version = "0.40.0", features = ["remote"] }

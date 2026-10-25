@@ -26,7 +26,6 @@ use std::{collections::HashMap, error::Error, sync::Arc};
 
 pub type PipelineResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 pub const GLOBAL_CHUNK_TABLE: &str = "arxiv_chunks";
-pub const GLOBAL_ABSTRACT_TABLE: &str = "arxiv_abstracts";
 
 #[derive(Clone, Debug)]
 pub struct TableNames {
@@ -854,12 +853,16 @@ impl<'a> HybridPipeline<'a> {
                 .vector_search(query_vector.clone())?
                 .column(&vector_column)
                 .distance_type(DistanceType::Cosine)
-                .select(Select::columns(&["paper_id", "abstract"]))
+                .select(Select::columns(&["paper_id"]))
                 .limit(candidate_limit)
                 .execute()
                 .await?,
         )
         .await?;
+        let mut dense = dense;
+        for hit in &mut dense {
+            hit.abstract_text = metadata_abstract(&abstract_table, &hit.paper_id).await?;
+        }
 
         let mut fused: HashMap<String, RankedHit> = HashMap::new();
         let mut lexical_rank = 0;
@@ -926,134 +929,16 @@ impl<'a> HybridPipeline<'a> {
     }
 }
 
-pub async fn ensure_abstract_table(
-    connection: &Connection,
-    metadata_table: &Table,
-) -> PipelineResult<Table> {
-    ensure_abstract_table_with_progress(connection, metadata_table, |_, _| async { Ok(()) }).await
-}
-
-pub async fn ensure_abstract_table_with_progress<F, Fut>(
-    connection: &Connection,
-    metadata_table: &Table,
-    mut progress: F,
-) -> PipelineResult<Table>
-where
-    F: FnMut(usize, usize) -> Fut,
-    Fut: std::future::Future<Output = PipelineResult<()>>,
-{
-    let total = metadata_table.count_rows(None).await?;
-    progress(0, total).await?;
-    let names = connection.table_names().execute().await?;
-    if names.iter().any(|name| name == GLOBAL_ABSTRACT_TABLE) {
-        let existing = connection
-            .open_table(GLOBAL_ABSTRACT_TABLE)
-            .execute()
-            .await?;
-        if existing.count_rows(None).await? == total {
-            progress(total, total).await?;
-            return Ok(existing);
-        }
-        let mut table = Some(existing);
-        copy_missing_abstracts(connection, metadata_table, &mut table, total, &mut progress)
-            .await?;
-        let table = table.expect("existing abstract table is present");
-        if table.count_rows(None).await? != total {
-            return Err("abstract table row count does not match metadata table".into());
-        }
-        return Ok(table);
-    }
-    let mut table = None;
-    copy_missing_abstracts(connection, metadata_table, &mut table, total, &mut progress).await?;
-    let table = table.ok_or("metadata table contains no abstract rows")?;
-    if table.count_rows(None).await? != total {
-        return Err("abstract table row count does not match metadata table".into());
-    }
-    Ok(table)
-}
-
-async fn copy_missing_abstracts<F, Fut>(
-    connection: &Connection,
-    metadata_table: &Table,
-    table: &mut Option<Table>,
-    total: usize,
-    progress: &mut F,
-) -> PipelineResult<()>
-where
-    F: FnMut(usize, usize) -> Fut,
-    Fut: std::future::Future<Output = PipelineResult<()>>,
-{
-    let mut completed = 0;
-    let mut source = metadata_table
-        .query()
-        .select(Select::columns(&["paper_id", "abstract"]))
-        .execute()
-        .await?;
-    while let Some(batch) = source.next().await {
-        let batch = batch?;
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let row_count = batch.num_rows();
-        if table.is_none() {
-            let schema = batch.schema();
-            let reader: Box<dyn RecordBatchReader + Send> = Box::new(RecordBatchIterator::new(
-                vec![Ok(batch)].into_iter(),
-                schema,
-            ));
-            *table = Some(
-                connection
-                    .create_table(GLOBAL_ABSTRACT_TABLE, reader)
-                    .execute()
-                    .await?,
-            );
-            completed += row_count;
-            progress(completed, total).await?;
-            continue;
-        }
-        let target = table.as_ref().expect("table is initialized");
-        let target_schema = target.schema().await?;
-        let columns = target_schema
-            .fields()
-            .iter()
-            .map(|field| {
-                batch
-                    .schema()
-                    .index_of(field.name())
-                    .map(|index| batch.column(index).clone())
-                    .or_else(|_| {
-                        if matches!(field.data_type(), DataType::FixedSizeList(_, _)) {
-                            Ok(new_null_array(field.data_type(), batch.num_rows()))
-                        } else {
-                            Err(lancedb::arrow::arrow_schema::ArrowError::SchemaError(
-                                format!("cannot populate abstract table field {:?}", field.name()),
-                            ))
-                        }
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let upsert = RecordBatch::try_new(target_schema.clone(), columns)?;
-        let mut merge = target.merge_insert(&["paper_id"]);
-        merge.when_not_matched_insert_all();
-        merge
-            .execute(Box::new(RecordBatchIterator::new(
-                vec![Ok(upsert)].into_iter(),
-                target_schema,
-            )))
-            .await?;
-        completed += row_count;
-        progress(completed, total).await?;
-    }
-    Ok(())
-}
-
-pub async fn embed_abstract_paper(
-    connection: &Connection,
-    paper_id: &str,
+pub async fn embed_abstract_batch(
+    table: &Table,
+    papers: &[(String, String)],
     embedding_model: &str,
     ctx: usize,
     embedder: &dyn Embedder,
-) -> PipelineResult<bool> {
+) -> PipelineResult<usize> {
+    if papers.is_empty() {
+        return Ok(0);
+    }
     if embedder.model_name() != embedding_model {
         return Err(format!(
             "selected embedding model {embedding_model:?} does not match embedder {:?}",
@@ -1061,119 +946,146 @@ pub async fn embed_abstract_paper(
         )
         .into());
     }
-    let table = connection
-        .open_table(GLOBAL_ABSTRACT_TABLE)
-        .execute()
-        .await?;
-    let column_name = vector_column_name(embedding_model);
-    let escaped_id = paper_id.replace('\'', "''");
-    let has_vector_column = table.schema().await?.field_with_name(&column_name).is_ok();
-    let pending_filter = if has_vector_column {
-        format!("paper_id = '{escaped_id}' AND {column_name} IS NULL")
-    } else {
-        format!("paper_id = '{escaped_id}'")
-    };
-    let mut rows = table
-        .query()
-        .only_if(pending_filter.clone())
-        .select(Select::columns(&["abstract"]))
-        .limit(1)
-        .execute()
-        .await?;
-    let Some(batch) = rows.next().await else {
-        return Ok(false);
-    };
-    let batch = batch?;
-    if batch.num_rows() == 0 {
-        return Ok(false);
+    if papers
+        .iter()
+        .any(|(_, abstract_text)| abstract_text.trim().is_empty())
+    {
+        return Err("cannot embed an empty abstract".into());
     }
-    let abstract_array = batch
-        .column_by_name("abstract")
-        .ok_or("abstract table is missing abstract")?;
-    let abstract_text = utf8_at(abstract_array.as_ref(), 0)?;
-    if abstract_array.is_null(0) || abstract_text.trim().is_empty() {
-        return Err(format!("paper {paper_id:?} has no abstract to embed").into());
-    }
-    let vectors = embedder
-        .embed(&[abstract_text.to_owned()], EmbeddingTask::Document, ctx)
-        .await?;
-    let vector = vectors
-        .first()
-        .ok_or("embedding service returned no vector")?;
-    let dimensions = vector.len();
-    if dimensions == 0 || vector.iter().any(|value| !value.is_finite()) || vectors.len() != 1 {
-        return Err("embedding service returned an invalid vector".into());
-    }
-    if has_vector_column {
-        let schema = table.schema().await?;
-        if !matches!(
-            schema.field_with_name(&column_name)?.data_type(),
-            DataType::FixedSizeList(item, size)
-                if *size as usize == dimensions && item.data_type() == &DataType::Float32
-        ) {
-            return Err(format!(
-                "vector column {column_name:?} has an incompatible type or dimension"
-            )
-            .into());
+    let column = vector_column_name(embedding_model);
+    let has_column = table.schema().await?.field_with_name(&column).is_ok();
+    if has_column {
+        let ids = papers
+            .iter()
+            .map(|(id, _)| format!("'{}'", id.replace('\'', "''")))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut existing = table
+            .query()
+            .only_if(format!("paper_id IN ({ids}) AND {column} IS NULL"))
+            .select(Select::columns(&["paper_id"]))
+            .execute()
+            .await?;
+        let mut pending = std::collections::HashSet::new();
+        while let Some(batch) = existing.next().await {
+            let batch = batch?;
+            let values = batch
+                .column_by_name("paper_id")
+                .ok_or("metadata table missing paper_id")?;
+            for row in 0..batch.num_rows() {
+                pending.insert(utf8_at(values.as_ref(), row)?.to_owned());
+            }
         }
-    } else {
-        let vector_type = DataType::FixedSizeList(
+        let papers: Vec<_> = papers
+            .iter()
+            .filter(|(id, _)| pending.contains(id))
+            .cloned()
+            .collect();
+        if papers.is_empty() {
+            return Ok(0);
+        }
+        return write_abstract_batch(table, &papers, embedding_model, ctx, embedder).await;
+    }
+    write_abstract_batch(table, papers, embedding_model, ctx, embedder).await
+}
+
+async fn write_abstract_batch(
+    table: &Table,
+    papers: &[(String, String)],
+    embedding_model: &str,
+    ctx: usize,
+    embedder: &dyn Embedder,
+) -> PipelineResult<usize> {
+    let column = vector_column_name(embedding_model);
+    let texts: Vec<String> = papers.iter().map(|(_, text)| text.clone()).collect();
+    let vectors = embedder.embed(&texts, EmbeddingTask::Document, ctx).await?;
+    let dimensions = vectors.first().map(Vec::len).unwrap_or(0);
+    if vectors.len() != papers.len()
+        || dimensions == 0
+        || vectors
+            .iter()
+            .any(|v| v.len() != dimensions || v.iter().any(|x| !x.is_finite()))
+    {
+        return Err("embedding service returned invalid vectors".into());
+    }
+    if table.schema().await?.field_with_name(&column).is_err() {
+        let data_type = DataType::FixedSizeList(
             Arc::new(Field::new("item", DataType::Float32, true)),
             i32::try_from(dimensions)?,
         );
         table
             .add_columns()
             .transform(NewColumnTransform::AllNulls(Arc::new(Schema::new(vec![
-                Field::new(&column_name, vector_type, true),
+                Field::new(&column, data_type, true),
             ]))))
             .execute()
             .await?;
     }
-    let schema = table.schema().await?;
-    let mut rows = table
-        .query()
-        .only_if(format!(
-            "paper_id = '{escaped_id}' AND {column_name} IS NULL"
-        ))
-        .execute()
-        .await?;
-    let Some(batch) = rows.next().await else {
-        return Ok(false);
-    };
-    let batch = batch?;
-    if batch.num_rows() == 0 {
-        return Ok(false);
-    }
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("paper_id", DataType::Utf8, false),
+        Field::new(
+            &column,
+            DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                i32::try_from(dimensions)?,
+            ),
+            true,
+        ),
+    ]));
+    let vector_values: Vec<f32> = vectors.into_iter().flatten().collect();
     let vector_array = Arc::new(FixedSizeListArray::try_new(
         Arc::new(Field::new("item", DataType::Float32, true)),
         i32::try_from(dimensions)?,
-        Arc::new(Float32Array::from(vector.clone())),
+        Arc::new(Float32Array::from(vector_values)),
         None,
     )?);
-    let mut columns = batch.columns().to_vec();
-    let vector_index = schema.index_of(&column_name)?;
-    columns[vector_index] = vector_array;
-    let updated = RecordBatch::try_new(schema.clone(), columns)?;
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                papers.iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(),
+            )),
+            vector_array,
+        ],
+    )?;
     let mut merge = table.merge_insert(&["paper_id"]);
     merge.when_matched_update_all(None);
     merge
         .execute(Box::new(RecordBatchIterator::new(
-            vec![Ok(updated)].into_iter(),
+            vec![Ok(batch)].into_iter(),
             schema,
         )))
         .await?;
-    Ok(true)
+    Ok(papers.len())
 }
 
 pub async fn ensure_abstract_vector_index(
-    connection: &Connection,
+    table: &Table,
     embedding_model: &str,
 ) -> PipelineResult<()> {
-    let table = connection
-        .open_table(GLOBAL_ABSTRACT_TABLE)
+    ensure_vector_index_for_table(table, embedding_model).await
+}
+
+async fn metadata_abstract(table: &Table, paper_id: &str) -> PipelineResult<String> {
+    let escaped_id = paper_id.replace('\'', "''");
+    let mut rows = table
+        .query()
+        .only_if(format!("paper_id = '{escaped_id}'"))
+        .select(Select::columns(&["abstract"]))
+        .limit(1)
         .execute()
         .await?;
-    ensure_vector_index_for_table(&table, embedding_model).await
+    let Some(batch) = rows.next().await else {
+        return Err(format!("metadata missing for {paper_id}").into());
+    };
+    let batch = batch?;
+    let values = batch
+        .column_by_name("abstract")
+        .ok_or("metadata table missing abstract")?;
+    if batch.num_rows() == 0 || values.is_null(0) {
+        return Err(format!("abstract missing for {paper_id}").into());
+    }
+    Ok(utf8_at(values.as_ref(), 0)?.to_owned())
 }
 
 async fn ensure_vector_index_for_table(table: &Table, embedding_model: &str) -> PipelineResult<()> {
@@ -1314,16 +1226,13 @@ async fn collect_abstract_ranked(
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or("paper_id must be a UTF-8 string")?;
-        let abstracts = batch
-            .column_by_name("abstract")
-            .ok_or("query result is missing abstract")?;
         for row in 0..batch.num_rows() {
-            if paper_ids.is_null(row) || abstracts.is_null(row) {
+            if paper_ids.is_null(row) {
                 continue;
             }
             hits.push(AbstractRawHit {
                 paper_id: paper_ids.value(row).to_owned(),
-                abstract_text: utf8_at(abstracts.as_ref(), row)?.to_owned(),
+                abstract_text: String::new(),
             });
         }
     }
@@ -1363,8 +1272,8 @@ pub fn vector_column_name(model: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        GLOBAL_ABSTRACT_TABLE, HybridPipeline, TableNames, embed_abstract_paper,
-        ensure_abstract_table, ensure_abstract_vector_index, vector_column_name,
+        HybridPipeline, TableNames, embed_abstract_batch, ensure_abstract_vector_index,
+        vector_column_name,
     };
     use crate::test_pipeline::{Embedder, EmbeddingTask, ModelFuture, PipelineResult, Reranker};
     use lancedb::{
@@ -1596,39 +1505,19 @@ mod tests {
             .create_table("metadata_test", metadata_batch)
             .execute()
             .await?;
-        let mut preparation_updates = Vec::new();
-        let abstracts =
-            super::ensure_abstract_table_with_progress(&database, &metadata, |completed, total| {
-                preparation_updates.push((completed, total));
-                async { Ok(()) }
-            })
-            .await?;
-        assert_eq!(preparation_updates.first(), Some(&(0, 2)));
-        assert_eq!(preparation_updates.last(), Some(&(2, 2)));
-        let initial_schema = abstracts.schema().await?;
         assert_eq!(
-            initial_schema
-                .fields()
-                .iter()
-                .map(|field| field.name().as_str())
-                .collect::<Vec<_>>(),
-            ["paper_id", "abstract"]
-        );
-        assert_eq!(abstracts.count_rows(None).await?, 2);
-
-        assert!(
-            embed_abstract_paper(
-                &database,
-                "paper-1",
+            embed_abstract_batch(
+                &metadata,
+                &[("paper-1".to_owned(), "relevant scientific topic".to_owned())],
                 "mock-embedding",
                 32_768,
                 &MockEmbedder,
             )
-            .await?
+            .await?,
+            1
         );
-        let abstracts = database.open_table(GLOBAL_ABSTRACT_TABLE).execute().await?;
         assert_eq!(
-            abstracts
+            metadata
                 .count_rows(Some(format!(
                     "paper_id = 'paper-2' AND {} IS NULL",
                     vector_column_name("mock-embedding")
@@ -1637,28 +1526,29 @@ mod tests {
             1
         );
         assert!(
-            !embed_abstract_paper(
-                &database,
-                "paper-1",
+            embed_abstract_batch(
+                &metadata,
+                &[("paper-1".to_owned(), "relevant scientific topic".to_owned())],
                 "mock-embedding",
                 32_768,
                 &MockEmbedder,
             )
             .await?
+                == 0
         );
         assert!(
-            embed_abstract_paper(
-                &database,
-                "paper-2",
+            embed_abstract_batch(
+                &metadata,
+                &[("paper-2".to_owned(), "unrelated topic".to_owned())],
                 "mock-embedding",
                 32_768,
                 &MockEmbedder,
             )
             .await?
+                == 1
         );
-        let abstracts = database.open_table(GLOBAL_ABSTRACT_TABLE).execute().await?;
-        let abstract_schema = abstracts.schema().await?;
-        assert_eq!(abstracts.count_rows(None).await?, 2);
+        let abstract_schema = metadata.schema().await?;
+        assert_eq!(metadata.count_rows(None).await?, 2);
         assert!(
             !abstract_schema
                 .fields()
@@ -1670,7 +1560,7 @@ mod tests {
                 .field_with_name(&vector_column_name("mock-embedding"))
                 .is_ok()
         );
-        ensure_abstract_vector_index(&database, "mock-embedding").await?;
+        ensure_abstract_vector_index(&metadata, "mock-embedding").await?;
 
         let pipeline = HybridPipeline::new(
             &database,
@@ -1702,7 +1592,7 @@ mod tests {
         let result = pipeline
             .search_abstract(
                 &full_text,
-                GLOBAL_ABSTRACT_TABLE,
+                "metadata_test",
                 "relevant",
                 "mock-embedding",
                 None,
