@@ -73,13 +73,17 @@ type ChunkApiResponse = Omit<ChunkResponse, "chunks"> & {
 
 type IndexJobProgress = {
   job_id: string;
-  state: "queued" | "running" | "complete" | "complete_with_errors" | "failed";
+  state: "queued" | "running" | "paused" | "complete" | "complete_with_errors" | "failed";
   total_papers: number;
   scanned_papers: number;
+  elapsed_seconds: number;
+  papers_per_second: number;
+  eta_seconds: number | null;
   chunked_papers: number;
   embedded_papers: number;
   failed_papers: number;
   current_paper: string | null;
+  phase: string | null;
   error: string | null;
 };
 
@@ -139,6 +143,17 @@ function HighlightText({ text, query }: { text: string; query: string }) {
 
 function escapeRegExp(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function formatDuration(seconds: number | null) {
+  if (seconds === null || !Number.isFinite(seconds)) return "calculating…";
+  const totalSeconds = Math.max(0, Math.ceil(seconds));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const remainder = totalSeconds % 60;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m ${remainder}s`;
+  return `${remainder}s`;
 }
 
 function LatexSnippet({ source, query, renderLatex }: { source: string; query: string; renderLatex: boolean }) {
@@ -420,6 +435,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [chunkResult, setChunkResult] = useState<ChunkResponse | null>(null);
   const [chunkBusy, setChunkBusy] = useState(false);
   const [embeddingBusy, setEmbeddingBusy] = useState(false);
+  const [indexJobControlBusy, setIndexJobControlBusy] = useState(false);
   const [chunkError, setChunkError] = useState("");
   const [embeddingModel, setEmbeddingModel] = useState("");
   const [indexJobProgress, setIndexJobProgress] = useState<IndexJobProgress | null>(null);
@@ -430,7 +446,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const [modelChoicesError, setModelChoicesError] = useState("");
   const [selectedEmbeddingModel, setSelectedEmbeddingModel] = useState("");
   const [selectedRerankerModel, setSelectedRerankerModel] = useState("");
-  const [tokenBudget, setTokenBudget] = useState(512);
+  const [tokenBudget, setTokenBudget] = useState(480);
 
   useEffect(() => {
     let active = true;
@@ -696,6 +712,25 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
     }
   }
 
+  async function setIndexingPaused(paused: boolean) {
+    const client = clientRef.current;
+    const job = indexJobProgress;
+    if (!client || !job || indexJobControlBusy) return;
+    setIndexJobControlBusy(true);
+    setChunkError("");
+    try {
+      const response = await client.callTool({
+        name: "set_indexing_job_paused",
+        arguments: { job_id: job.job_id, paused },
+      });
+      getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean });
+    } catch (reason) {
+      setChunkError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setIndexJobControlBusy(false);
+    }
+  }
+
   async function embedPaperChunks() {
     if (!selected || !chunkResult || chunkResult.chunks.length === 0) return;
     await startIndexingJob(selected.paper_id);
@@ -751,12 +786,31 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             value={indexJobProgress.scanned_papers}
           />
           <span>
-            Index job {indexJobProgress.state}: {indexJobProgress.scanned_papers.toLocaleString()} /{" "}
-            {indexJobProgress.total_papers.toLocaleString()} papers scanned ·{" "}
+            Index job {indexJobProgress.state} · {indexJobProgress.scanned_papers.toLocaleString()} /{" "}
+            {indexJobProgress.total_papers.toLocaleString()} papers ·{" "}
+            {indexJobProgress.papers_per_second.toFixed(2)} papers/s · ETA{" "}
+            {formatDuration(indexJobProgress.eta_seconds)} · elapsed{" "}
+            {formatDuration(indexJobProgress.elapsed_seconds)} ·{" "}
+            {indexJobProgress.chunked_papers.toLocaleString()} chunked ·{" "}
             {indexJobProgress.embedded_papers.toLocaleString()} embedded ·{" "}
             {indexJobProgress.failed_papers.toLocaleString()} failed
+            {indexJobProgress.phase && ` · ${indexJobProgress.phase}`}
             {indexJobProgress.current_paper && ` · current: ${indexJobProgress.current_paper}`}
           </span>
+          {(indexJobProgress.state === "running" || indexJobProgress.state === "paused") && (
+            <button
+              className="chunk-button"
+              onClick={() => void setIndexingPaused(indexJobProgress.state !== "paused")}
+              disabled={indexJobControlBusy}
+            >
+              {indexJobControlBusy
+                ? "Updating…"
+                : indexJobProgress.state === "paused"
+                  ? "Resume indexing"
+                  : "Pause indexing"}
+            </button>
+          )}
+          <span>Pausing waits for the in-flight embedding request to finish.</span>
         </div>
       )}
 

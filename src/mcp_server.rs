@@ -37,10 +37,10 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokenizers::Tokenizer;
-use tokio::sync::{RwLock, broadcast};
+use tokio::sync::{Notify, RwLock, Semaphore, broadcast};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::ServeDir,
@@ -53,7 +53,8 @@ const SEARCH_SNIPPET_CHARS: usize = 600;
 const MAX_PAPER_CHARS: usize = 1_000_000;
 const DEFAULT_EMBEDDING_CTX: usize = 32_768;
 const MAX_LFM_EMBEDDING_TOKENS: usize = 512;
-const DEFAULT_CHUNK_TOKEN_BUDGET: usize = 512;
+const DEFAULT_CHUNK_TOKEN_BUDGET: usize =
+    MAX_LFM_EMBEDDING_TOKENS - crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM;
 
 static NEXT_INDEX_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -63,11 +64,17 @@ struct IndexJobProgress {
     state: String,
     total_papers: usize,
     scanned_papers: usize,
+    elapsed_seconds: f64,
+    papers_per_second: f64,
+    eta_seconds: Option<f64>,
     chunked_papers: usize,
     embedded_papers: usize,
     failed_papers: usize,
     current_paper: Option<String>,
+    phase: Option<String>,
     error: Option<String>,
+    #[serde(skip_serializing)]
+    started_at: Instant,
 }
 
 #[derive(Clone)]
@@ -75,6 +82,8 @@ struct IndexJobManager {
     progress: Arc<RwLock<Option<IndexJobProgress>>>,
     updates: broadcast::Sender<IndexJobProgress>,
     active: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    resume: Arc<Notify>,
 }
 
 impl IndexJobManager {
@@ -84,6 +93,8 @@ impl IndexJobManager {
             progress: Arc::new(RwLock::new(None)),
             updates,
             active: Arc::new(AtomicBool::new(false)),
+            paused: Arc::new(AtomicBool::new(false)),
+            resume: Arc::new(Notify::new()),
         }
     }
 
@@ -108,12 +119,18 @@ impl IndexJobManager {
             state: "queued".to_owned(),
             total_papers,
             scanned_papers: 0,
+            elapsed_seconds: 0.0,
+            papers_per_second: 0.0,
+            eta_seconds: None,
             chunked_papers: 0,
             embedded_papers: 0,
             failed_papers: 0,
             current_paper: paper_id,
+            phase: Some("queued".to_owned()),
             error: None,
+            started_at: Instant::now(),
         };
+        self.paused.store(false, Ordering::Release);
         *self.progress.write().await = Some(initial.clone());
         let _ = self.updates.send(initial);
         Ok(job_id)
@@ -122,6 +139,22 @@ impl IndexJobManager {
     async fn update(&self, update: impl FnOnce(&mut IndexJobProgress)) {
         if let Some(progress) = self.progress.write().await.as_mut() {
             update(progress);
+            progress.elapsed_seconds = progress.started_at.elapsed().as_secs_f64();
+            progress.papers_per_second = if progress.elapsed_seconds > 0.0 {
+                progress.scanned_papers as f64 / progress.elapsed_seconds
+            } else {
+                0.0
+            };
+            progress.eta_seconds = if progress.papers_per_second > 0.0 {
+                Some(
+                    progress
+                        .total_papers
+                        .saturating_sub(progress.scanned_papers) as f64
+                        / progress.papers_per_second,
+                )
+            } else {
+                None
+            };
             let _ = self.updates.send(progress.clone());
         }
     }
@@ -130,10 +163,48 @@ impl IndexJobManager {
         self.update(|progress| {
             progress.state = state.to_owned();
             progress.current_paper = None;
+            progress.phase = None;
             progress.error = error;
         })
         .await;
+        self.paused.store(false, Ordering::Release);
+        self.resume.notify_waiters();
+        self.resume.notify_one();
         self.active.store(false, Ordering::Release);
+    }
+
+    async fn set_paused(&self, job_id: &str, paused: bool) -> Result<(), String> {
+        let mut current = self.progress.write().await;
+        let progress = current
+            .as_mut()
+            .filter(|progress| progress.job_id == job_id)
+            .ok_or_else(|| format!("No indexing job found with ID {job_id:?}"))?;
+        if !matches!(progress.state.as_str(), "running" | "paused") {
+            return Err(format!(
+                "Cannot change pause state while indexing job is {}",
+                progress.state
+            ));
+        }
+        self.paused.store(paused, Ordering::Release);
+        progress.state = if paused { "paused" } else { "running" }.to_owned();
+        let snapshot = progress.clone();
+        drop(current);
+        let _ = self.updates.send(snapshot);
+        if !paused {
+            self.resume.notify_waiters();
+            self.resume.notify_one();
+        }
+        Ok(())
+    }
+
+    async fn wait_until_resumed(&self) {
+        loop {
+            let resumed = self.resume.notified();
+            if !self.paused.load(Ordering::Acquire) {
+                return;
+            }
+            resumed.await;
+        }
     }
 
     async fn subscribe(
@@ -149,6 +220,31 @@ impl IndexJobManager {
             .filter(|progress| progress.job_id == job_id)
             .ok_or_else(|| format!("No indexing job found with ID {job_id:?}"))?;
         Ok((current, receiver))
+    }
+}
+
+struct JobPausableEmbedder<'a> {
+    inner: &'a dyn Embedder,
+    jobs: Option<&'a IndexJobManager>,
+}
+
+impl Embedder for JobPausableEmbedder<'_> {
+    fn model_name(&self) -> &str {
+        self.inner.model_name()
+    }
+
+    fn embed<'a>(
+        &'a self,
+        texts: &'a [String],
+        task: crate::test_pipeline::EmbeddingTask,
+        ctx: usize,
+    ) -> crate::test_pipeline::ModelFuture<'a, Vec<Vec<f32>>> {
+        Box::pin(async move {
+            if let Some(jobs) = self.jobs {
+                jobs.wait_until_resumed().await;
+            }
+            self.inner.embed(texts, task, ctx).await
+        })
     }
 }
 
@@ -210,7 +306,9 @@ struct PaperArgs {
 struct ChunkArgs {
     #[schemars(description = "arXiv paper identifier, for example 1706.03762")]
     paper_id: String,
-    #[schemars(description = "Estimated token budget per chunk; defaults to 512, maximum 2048")]
+    #[schemars(
+        description = "Tokenizer-measured budget per chunk; defaults to 480 and is capped by the safe model limit"
+    )]
     token_budget: Option<usize>,
 }
 
@@ -223,7 +321,7 @@ struct EmbedChunkBatchArgs {
     #[schemars(description = "Embedding model ID from list_models")]
     model: String,
     #[schemars(
-        description = "Maximum embedding input tokens; defaults to 32768 and is capped at the LFM model limit of 512"
+        description = "Embedding context; defaults to 32768 and applies a 32-token safety margin below the configured model limit"
     )]
     ctx: Option<usize>,
 }
@@ -255,7 +353,7 @@ struct TestPaperArgs {
     )]
     candidate_limit: Option<usize>,
     #[schemars(
-        description = "Maximum embedding input tokens; defaults to 32768 and is capped at the LFM model limit of 512"
+        description = "Embedding context; defaults to 32768 and applies a 32-token safety margin below the configured model limit"
     )]
     ctx: Option<usize>,
 }
@@ -267,7 +365,7 @@ struct EmbedTextsArgs {
     #[schemars(description = "Optional embedding model ID from list_models")]
     model: Option<String>,
     #[schemars(
-        description = "Maximum embedding input tokens; defaults to 32768 and is capped at the LFM model limit of 512"
+        description = "Embedding context; defaults to 32768 and applies a 32-token safety margin below the configured model limit"
     )]
     ctx: Option<usize>,
 }
@@ -287,7 +385,7 @@ struct HybridChunkSearchArgs {
     #[schemars(description = "Maximum fused candidates to return; defaults to 30, maximum 100")]
     candidate_limit: Option<usize>,
     #[schemars(
-        description = "Maximum embedding input tokens; defaults to 32768 and is capped at the LFM model limit of 512"
+        description = "Embedding context; defaults to 32768 and applies a 32-token safety margin below the configured model limit"
     )]
     ctx: Option<usize>,
 }
@@ -298,8 +396,18 @@ struct StartIndexJobArgs {
         description = "Optional paper ID for a one-paper run; omit to process all pending papers"
     )]
     paper_id: Option<String>,
-    #[schemars(description = "Chunk token budget; defaults to 512")]
+    #[schemars(
+        description = "Tokenizer-measured chunk budget; defaults to 480 and is capped by the safe model limit"
+    )]
     token_budget: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SetIndexJobPausedArgs {
+    #[schemars(description = "Index job ID returned by start_indexing_job")]
+    job_id: String,
+    #[schemars(description = "Pause after the in-flight embedding request finishes, or resume")]
+    paused: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -384,6 +492,7 @@ struct ArxivMcpServer {
     model_list_endpoint: String,
     reranker_endpoint: String,
     embedding_tokenizer: Arc<Tokenizer>,
+    embedding_scheduler: Arc<Semaphore>,
     embedding_ctx: usize,
     embedding_max_tokens: usize,
     index_jobs: IndexJobManager,
@@ -404,6 +513,7 @@ impl ArxivMcpServer {
         model_list_endpoint: String,
         reranker_endpoint: String,
         embedding_tokenizer: Arc<Tokenizer>,
+        embedding_scheduler: Arc<Semaphore>,
         index_jobs: IndexJobManager,
     ) -> Self {
         Self {
@@ -418,6 +528,7 @@ impl ArxivMcpServer {
             model_list_endpoint,
             reranker_endpoint,
             embedding_tokenizer,
+            embedding_scheduler,
             embedding_ctx: DEFAULT_EMBEDDING_CTX,
             embedding_max_tokens: embedding.max_tokens,
             index_jobs,
@@ -431,8 +542,39 @@ impl ArxivMcpServer {
             &self.embedding_endpoint,
             self.embedding_tokenizer.clone(),
             self.embedding_max_tokens,
+            self.embedding_scheduler.clone(),
         )
         .map_err(internal_error)
+    }
+
+    fn chunk_embedding_text(
+        &self,
+        text: &str,
+        requested_budget: usize,
+        ctx: usize,
+    ) -> Result<Vec<crate::chunking::Chunk>, Box<dyn Error + Send + Sync>> {
+        let safe_limit =
+            crate::test_pipeline::effective_embedding_token_limit(ctx, self.embedding_max_tokens)?;
+        let budget = requested_budget.min(safe_limit);
+        let tokenization_error = std::cell::RefCell::new(None);
+        let cost = |chunk: &str| {
+            let input = format!("document: {chunk}");
+            match self.embedding_tokenizer.encode(input, true) {
+                Ok(encoding) => encoding.get_ids().len(),
+                Err(error) => {
+                    *tokenization_error.borrow_mut() = Some(error.to_string());
+                    usize::MAX
+                }
+            }
+        };
+        let chunks = crate::chunking::chunk_text_with_cost(text, budget, &cost);
+        if let Some(error) = tokenization_error.into_inner() {
+            return Err(error.into());
+        }
+        if chunks.iter().any(|chunk| chunk.cost > safe_limit) {
+            return Err("tokenizer could not split text within the safe embedding limit".into());
+        }
+        Ok(chunks)
     }
 
     fn reranker(&self, model: &str) -> Result<crate::test_pipeline::HttpReranker, McpError> {
@@ -471,9 +613,11 @@ impl ArxivMcpServer {
         let mut chunked_count = 0;
         let mut embedded_count = 0;
         let mut failed_count = 0;
+        let mut last_progress_update = Instant::now();
         while let Some(batch) = rows.next().await {
             let batch = batch?;
             for row in 0..batch.num_rows() {
+                self.index_jobs.wait_until_resumed().await;
                 let current_id = string_at(&batch, "paper_id", row)?
                     .ok_or("indexing source row has a null paper_id")?;
                 let text = string_at(&batch, "text", row)?
@@ -493,11 +637,12 @@ impl ArxivMcpServer {
                     row,
                 )?;
                 let indexed_model = string_at(&batch, "embedding_model", row)?;
-                if paper_id.is_some() {
-                    self.index_jobs
-                        .update(|progress| progress.current_paper = Some(current_id.clone()))
-                        .await;
-                }
+                self.index_jobs
+                    .update(|progress| {
+                        progress.current_paper = Some(current_id.clone());
+                        progress.phase = Some("processing".to_owned());
+                    })
+                    .await;
                 match self
                     .process_paper(
                         &database,
@@ -509,6 +654,7 @@ impl ArxivMcpServer {
                         self.embedding_ctx,
                         token_budget,
                         paper_id.is_some(),
+                        true,
                     )
                     .await
                 {
@@ -530,7 +676,10 @@ impl ArxivMcpServer {
                     }
                 }
                 scanned += 1;
-                if scanned % 100 == 0 || paper_id.is_some() {
+                if scanned % 100 == 0
+                    || paper_id.is_some()
+                    || last_progress_update.elapsed().as_secs_f64() >= 1.0
+                {
                     self.index_jobs
                         .update(|progress| {
                             progress.scanned_papers = scanned;
@@ -540,6 +689,7 @@ impl ArxivMcpServer {
                             progress.current_paper = Some(current_id);
                         })
                         .await;
+                    last_progress_update = Instant::now();
                 }
             }
         }
@@ -627,6 +777,7 @@ impl ArxivMcpServer {
                     ctx,
                     token_budget,
                     true,
+                    false,
                 )
                 .await;
         }
@@ -644,6 +795,7 @@ impl ArxivMcpServer {
         ctx: usize,
         token_budget: usize,
         finalize_index: bool,
+        pauseable: bool,
     ) -> Result<(usize, bool), Box<dyn Error + Send + Sync>> {
         let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
             database,
@@ -651,9 +803,18 @@ impl ArxivMcpServer {
                 chunks: crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE.to_owned(),
             },
         );
+        self.index_jobs
+            .update(|progress| {
+                progress.current_paper = Some(paper_id.to_owned());
+                progress.phase = Some("checking chunks".to_owned());
+            })
+            .await;
         let same_model = indexed_model == Some(self.embedding_model.as_str());
         if chunked != Some(true) {
-            let chunks = crate::chunking::chunk_text(text, token_budget);
+            self.index_jobs
+                .update(|progress| progress.phase = Some("tokenizing and chunking".to_owned()))
+                .await;
+            let chunks = self.chunk_embedding_text(text, token_budget, ctx)?;
             if chunks.is_empty() {
                 return Err(format!("paper {paper_id:?} produced no chunks").into());
             }
@@ -692,9 +853,16 @@ impl ArxivMcpServer {
         }
 
         let embedder = self.embedder(&self.embedding_model)?;
+        let job_embedder = JobPausableEmbedder {
+            inner: &embedder,
+            jobs: pauseable.then_some(&self.index_jobs),
+        };
+        self.index_jobs
+            .update(|progress| progress.phase = Some("embedding chunks".to_owned()))
+            .await;
         let embedding = if finalize_index {
             pipeline
-                .embed_paper_chunks(paper_id, &self.embedding_model, ctx, &embedder, 4)
+                .embed_paper_chunks(paper_id, &self.embedding_model, ctx, &job_embedder, 4)
                 .await
         } else {
             pipeline
@@ -702,7 +870,7 @@ impl ArxivMcpServer {
                     paper_id,
                     &self.embedding_model,
                     ctx,
-                    &embedder,
+                    &job_embedder,
                     4,
                 )
                 .await
@@ -957,7 +1125,9 @@ impl ArxivMcpServer {
                 .unwrap_or_default();
             let (source, truncated) = truncate_chars(source, MAX_PAPER_CHARS);
             let table_name = crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE;
-            let chunks = crate::chunking::chunk_text(&source, token_budget);
+            let chunks = self
+                .chunk_embedding_text(&source, token_budget, self.embedding_ctx)
+                .map_err(internal_error)?;
             return serde_json::to_string_pretty(&serde_json::json!({
                 "paper_id": id,
                 "chunk_table": table_name,
@@ -1036,10 +1206,19 @@ impl ArxivMcpServer {
         tokio::spawn(async move {
             jobs.update(|progress| progress.state = "running".to_owned())
                 .await;
+            let heartbeat_jobs = jobs.clone();
+            let heartbeat = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    heartbeat_jobs.update(|_| {}).await;
+                }
+            });
             match server.run_index_job(paper_id, token_budget).await {
                 Ok(()) => jobs.finish("complete", None).await,
                 Err(error) => jobs.finish("failed", Some(error.to_string())).await,
             };
+            heartbeat.abort();
         });
         Ok(serde_json::json!({
             "job_id": running_id,
@@ -1047,6 +1226,31 @@ impl ArxivMcpServer {
             "state": "queued",
         })
         .to_string())
+    }
+
+    #[tool(
+        description = "Pause an indexing job after its in-flight embedding request finishes, or resume it."
+    )]
+    async fn set_indexing_job_paused(
+        &self,
+        Parameters(args): Parameters<SetIndexJobPausedArgs>,
+    ) -> Result<String, McpError> {
+        let job_id = args.job_id.trim();
+        if job_id.is_empty() || job_id.len() > 128 {
+            return Err(McpError::invalid_params(
+                "job_id must contain between 1 and 128 bytes",
+                None,
+            ));
+        }
+        self.index_jobs
+            .set_paused(job_id, args.paused)
+            .await
+            .map_err(|error| McpError::invalid_request(error, None))?;
+        serde_json::to_string(&serde_json::json!({
+            "job_id": job_id,
+            "paused": args.paused,
+        }))
+        .map_err(internal_error)
     }
 
     #[tool(
@@ -1514,10 +1718,12 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
         || config.models.embedding.repo.trim().is_empty()
         || config.models.embedding.path.trim().is_empty()
         || config.models.embedding.tokenizer_path.trim().is_empty()
-        || !(2..=MAX_LFM_EMBEDDING_TOKENS).contains(&config.models.embedding.max_tokens)
+        || !(crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM + 2..=MAX_LFM_EMBEDDING_TOKENS)
+            .contains(&config.models.embedding.max_tokens)
     {
         return Err(format!(
-            "models.embedding requires non-empty id, repo, path, and tokenizerPath; maxTokens must be from 2 to {MAX_LFM_EMBEDDING_TOKENS}"
+            "models.embedding requires non-empty id, repo, path, and tokenizerPath; maxTokens must be from {} to {MAX_LFM_EMBEDDING_TOKENS}",
+            crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM + 2
         )
         .into());
     }
@@ -1590,6 +1796,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             SocketAddr::new(config.llama.host, config.llama.port)
         ),
         tokenizer,
+        Arc::new(Semaphore::new(1)),
         index_jobs.clone(),
     );
 
@@ -1859,9 +2066,9 @@ fn validate_embedding_ctx(ctx: usize) -> Result<usize, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_EMBEDDING_CTX, SEARCH_SNIPPET_CHARS, ensure_indexing_state_fields,
-        pending_index_filter, search_excerpt, sql_string, update_paper_index_state,
-        validate_embedding_ctx,
+        DEFAULT_EMBEDDING_CTX, IndexJobManager, MAX_LFM_EMBEDDING_TOKENS, SEARCH_SNIPPET_CHARS,
+        ensure_indexing_state_fields, pending_index_filter, search_excerpt, sql_string,
+        update_paper_index_state, validate_embedding_ctx,
     };
     use lancedb::{
         arrow::{
@@ -1881,6 +2088,50 @@ mod tests {
         );
         assert!(validate_embedding_ctx(0).is_err());
         assert!(validate_embedding_ctx(DEFAULT_EMBEDDING_CTX + 1).is_err());
+    }
+
+    #[test]
+    fn embedding_limit_reserves_headroom_below_model_context() {
+        assert_eq!(
+            crate::test_pipeline::effective_embedding_token_limit(
+                DEFAULT_EMBEDDING_CTX,
+                MAX_LFM_EMBEDDING_TOKENS
+            )
+            .unwrap(),
+            MAX_LFM_EMBEDDING_TOKENS - crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM
+        );
+        assert!(
+            crate::test_pipeline::effective_embedding_token_limit(
+                crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM + 1,
+                MAX_LFM_EMBEDDING_TOKENS
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn indexing_job_pause_waits_for_resume() {
+        let jobs = IndexJobManager::new();
+        let job_id = jobs.start(None, 1).await.unwrap();
+        jobs.update(|progress| progress.state = "running".to_owned())
+            .await;
+        jobs.set_paused(&job_id, true).await.unwrap();
+
+        let waiter_jobs = jobs.clone();
+        let mut waiter = tokio::spawn(async move {
+            waiter_jobs.wait_until_resumed().await;
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut waiter)
+                .await
+                .is_err()
+        );
+
+        jobs.set_paused(&job_id, false).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[tokio::test]

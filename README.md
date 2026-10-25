@@ -76,7 +76,12 @@ The database path and table names remain backend environment settings:
   metadata.
 - `start_indexing_job(paper_id?, token_budget?)`: queue either one paper or all
   papers still pending chunking/embedding. The backend owns the job and streams
-  progress at `/indexing-jobs/{job_id}/events`.
+  progress at `/indexing-jobs/{job_id}/events`, including papers per second,
+  elapsed time, estimated time remaining, current paper, and processing phase.
+  The web UI can pause and resume a job; pausing waits for the in-flight
+  embedding request to finish and blocks subsequent embedding requests.
+  Single-paper jobs and full-corpus jobs use the same per-paper processing
+  routine; only selection and vector-index finalization differ.
 - `test_paper_chunks(paper_id, query, candidate_limit?)`: index or resume the
   paper through the shared corpus pipeline, then test its chunks using the
   hybrid retrieval pipeline.
@@ -159,11 +164,15 @@ connection alive across chat sessions.
 The Rust backend sends LFM embedding requests to the existing llama-server
 configured by `llama.host` and `llama.port`. It adds the model's `query: ` or
 `document: ` prompt, tokenizes locally with the configured `tokenizer.json`,
-truncates from the right, then sends text to llama-server's
-`/v1/embeddings` endpoint. The effective input limit is the smaller of the
-requested `ctx` and `models.embedding.maxTokens` (512 by default). Embeddings
-are normalized in Rust. Qwen reranking remains on llama-server's `/rerank`
-endpoint.
+and sends text to llama-server's `/v1/embeddings` endpoint only after verifying
+the tokenized input length. Paper chunks are split using this same tokenizer
+and include the prompt and special tokens in their measured size. The safe
+limit is the smaller of the requested `ctx`, `models.embedding.maxTokens` (512
+by default), and the model's 768-token context, minus 32 tokens of headroom.
+Over-limit direct embedding inputs are rejected rather than silently truncated.
+All embedding requests share a single scheduler permit, so a new request waits
+until the previous embedding request has completed. Embeddings are normalized
+in Rust. Qwen reranking remains on llama-server's `/rerank` endpoint.
 
 The GGUF and tokenizer are user-managed; the Rust backend does not download
 model files. Their paths and the tokenizer's Hugging Face repo are in

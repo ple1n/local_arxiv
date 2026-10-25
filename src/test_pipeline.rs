@@ -3,9 +3,26 @@
 use serde::Deserialize;
 use std::{error::Error, future::Future, pin::Pin, sync::Arc};
 use tokenizers::Tokenizer;
+use tokio::sync::Semaphore;
 
 pub type PipelineResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 pub type ModelFuture<'a, T> = Pin<Box<dyn Future<Output = PipelineResult<T>> + Send + 'a>>;
+pub const LFM_CONTEXT_TOKENS: usize = 768;
+pub const EMBEDDING_TOKEN_HEADROOM: usize = 32;
+
+pub fn effective_embedding_token_limit(ctx: usize, max_tokens: usize) -> PipelineResult<usize> {
+    let limit = ctx
+        .min(max_tokens)
+        .min(LFM_CONTEXT_TOKENS)
+        .saturating_sub(EMBEDDING_TOKEN_HEADROOM);
+    if limit < 2 {
+        return Err(format!(
+            "embedding context must exceed the {EMBEDDING_TOKEN_HEADROOM}-token safety headroom"
+        )
+        .into());
+    }
+    Ok(limit)
+}
 
 /// Adapter contract for any embedding provider.
 pub trait Embedder: Send + Sync {
@@ -47,6 +64,7 @@ pub struct HttpEmbedder {
     model: String,
     tokenizer: Arc<Tokenizer>,
     max_tokens: usize,
+    scheduler: Arc<Semaphore>,
 }
 
 impl HttpEmbedder {
@@ -55,6 +73,7 @@ impl HttpEmbedder {
         endpoint: impl Into<String>,
         tokenizer: Arc<Tokenizer>,
         max_tokens: usize,
+        scheduler: Arc<Semaphore>,
     ) -> PipelineResult<Self> {
         if max_tokens < 2 {
             return Err("embedding max_tokens must be at least 2".into());
@@ -66,6 +85,7 @@ impl HttpEmbedder {
             model: model.into(),
             tokenizer,
             max_tokens,
+            scheduler,
         })
     }
 }
@@ -93,14 +113,12 @@ impl Embedder for HttpEmbedder {
         ctx: usize,
     ) -> ModelFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
-            let max_tokens = ctx.min(self.max_tokens);
-            if max_tokens < 2 {
-                return Err("embedding ctx must be at least 2 tokens".into());
-            }
+            let max_tokens = effective_embedding_token_limit(ctx, self.max_tokens)?;
             let inputs = texts
                 .iter()
                 .map(|text| prepare_embedding_input(&self.tokenizer, text, task, max_tokens))
                 .collect::<PipelineResult<Vec<_>>>()?;
+            let _permit = self.scheduler.acquire().await?;
             let mut request = self.client.post(&self.endpoint).json(&serde_json::json!({
                 "model": self.model,
                 "input": inputs,
@@ -149,19 +167,14 @@ fn prepare_embedding_input(
 ) -> PipelineResult<String> {
     let prefixed = format!("{}{text}", task.prefix());
     let encoding = tokenizer.encode(prefixed.as_str(), true)?;
-    if encoding.get_ids().len() <= max_tokens {
-        return Ok(prefixed);
+    let token_count = encoding.get_ids().len();
+    if token_count > max_tokens {
+        return Err(format!(
+            "embedding input is {token_count} tokens, exceeding the safe limit of {max_tokens}; split the text into smaller chunks"
+        )
+        .into());
     }
-
-    let ids = encoding.get_ids();
-    for keep_tokens in (2..max_tokens).rev() {
-        let candidate = tokenizer.decode(&ids[..keep_tokens], true)?;
-        let candidate_encoding = tokenizer.encode(candidate.as_str(), true)?;
-        if candidate_encoding.get_ids().len() <= max_tokens {
-            return Ok(candidate);
-        }
-    }
-    Err("embedding ctx is too small to preserve the task prefix".into())
+    Ok(prefixed)
 }
 
 #[derive(Clone)]
