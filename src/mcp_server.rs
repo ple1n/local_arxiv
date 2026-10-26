@@ -58,6 +58,7 @@ const DEFAULT_EMBEDDING_CTX: usize = 2048;
 const MAX_LFM_EMBEDDING_TOKENS: usize = 512;
 const DEFAULT_CHUNK_TOKEN_BUDGET: usize =
     MAX_LFM_EMBEDDING_TOKENS - crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM;
+const ABSTRACT_PERSIST_BATCH_SIZE: usize = 1024;
 
 static NEXT_INDEX_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -372,6 +373,126 @@ impl Embedder for JobPausableEmbedder {
             Ok(vectors)
         })
     }
+}
+
+fn take_abstract_persist_batch(
+    pending: &mut Vec<(String, String)>,
+    flush_tail: bool,
+) -> Option<Vec<(String, String)>> {
+    if pending.len() < ABSTRACT_PERSIST_BATCH_SIZE && !flush_tail {
+        return None;
+    }
+    let count = pending.len().min(ABSTRACT_PERSIST_BATCH_SIZE);
+    if count == 0 {
+        return None;
+    }
+    Some(pending.drain(..count).collect())
+}
+
+async fn embed_and_persist_abstract_batch(
+    table: &Table,
+    papers: Vec<(String, String)>,
+    embedding_model: &str,
+    embedding_ctx: usize,
+    job_embedder: &JobPausableEmbedder,
+    index_jobs: &IndexJobManager,
+    scanned: &mut usize,
+    embedded_count: &mut usize,
+    failed_count: &mut usize,
+    last_progress_update: &mut Instant,
+    single_paper: bool,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    const EMBEDDING_BATCH_SIZE: usize = 32;
+    let groups = papers
+        .chunks(EMBEDDING_BATCH_SIZE)
+        .map(|group| group.to_vec())
+        .collect::<Vec<_>>();
+    index_jobs
+        .update(|progress| progress.phase = Some("embedding abstracts".to_owned()))
+        .await;
+    let mut embedding_tasks = tokio::task::JoinSet::new();
+    for group in groups {
+        let embedding_model = embedding_model.to_owned();
+        let job_embedder = job_embedder.clone();
+        embedding_tasks.spawn(async move {
+            let vectors = crate::hybrid_pipeline::embed_abstract_vectors(
+                &group,
+                &embedding_model,
+                embedding_ctx,
+                &job_embedder,
+            )
+            .await;
+            (group, vectors)
+        });
+    }
+    let mut batch_papers = Vec::new();
+    let mut batch_vectors = Vec::new();
+    while let Some(joined) = embedding_tasks.join_next().await {
+        let (group, vector_result) = joined?;
+        let group_len = group.len();
+        let current = group.last().map(|(id, _)| id.clone());
+        match vector_result {
+            Ok(vectors) => {
+                batch_papers.extend(group);
+                batch_vectors.extend(vectors);
+            }
+            Err(error) => {
+                *failed_count += group.len();
+                eprintln!("Abstract batch embedding failed: {error}");
+                index_jobs
+                    .update(|progress| progress.error = Some(error.to_string()))
+                    .await;
+            }
+        }
+        *scanned += group_len;
+        if *scanned % 100 < EMBEDDING_BATCH_SIZE
+            || single_paper
+            || last_progress_update.elapsed().as_secs_f64() >= 1.0
+        {
+            index_jobs
+                .update(|progress| {
+                    progress.scanned_papers = *scanned;
+                    progress.chunked_papers = 0;
+                    progress.embedded_papers = *embedded_count;
+                    progress.failed_papers = *failed_count;
+                    progress.current_paper = current;
+                })
+                .await;
+            *last_progress_update = Instant::now();
+        }
+    }
+    if !batch_papers.is_empty() {
+        let write_started = Instant::now();
+        match crate::hybrid_pipeline::write_abstract_vectors(
+            table,
+            &batch_papers,
+            batch_vectors,
+            embedding_model,
+        )
+        .await
+        {
+            Ok(count) => {
+                *embedded_count += count;
+                eprintln!(
+                    "[abstract-index] persisted vectors={} elapsed_ms={}",
+                    count,
+                    write_started.elapsed().as_millis()
+                );
+            }
+            Err(error) => {
+                *failed_count += batch_papers.len();
+                eprintln!(
+                    "[abstract-index] vector write failed vectors={} elapsed_ms={}: {error}",
+                    batch_papers.len(),
+                    write_started.elapsed().as_millis()
+                );
+                index_jobs
+                    .update(|progress| progress.error = Some(error.to_string()))
+                    .await;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1196,106 +1317,47 @@ impl ArxivMcpServer {
         let mut embedded_count = 0;
         let mut failed_count = 0;
         let mut last_progress_update = Instant::now();
-        const EMBEDDING_BATCH_SIZE: usize = 32;
+        let mut pending_papers = Vec::with_capacity(ABSTRACT_PERSIST_BATCH_SIZE);
         while let Some(batch) = rows.next().await {
             let batch = batch?;
-            let mut papers = Vec::new();
             for row in 0..batch.num_rows() {
                 let id = string_at(&batch, "paper_id", row)?
                     .ok_or("abstract row has a null paper_id")?;
                 let abstract_text = string_at(&batch, "abstract", row)?.unwrap_or_default();
-                papers.push((id, abstract_text));
-            }
-            let groups = papers
-                .chunks(EMBEDDING_BATCH_SIZE)
-                .map(|group| group.to_vec())
-                .collect::<Vec<_>>();
-            self.index_jobs
-                .update(|progress| progress.phase = Some("embedding abstracts".to_owned()))
-                .await;
-            let mut embedding_tasks = tokio::task::JoinSet::new();
-            for group in groups {
-                let embedding_model = embedding_model.to_owned();
-                let embedding_ctx = self.embedding_ctx;
-                let job_embedder = job_embedder.clone();
-                embedding_tasks.spawn(async move {
-                    let vectors = crate::hybrid_pipeline::embed_abstract_vectors(
-                        &group,
-                        &embedding_model,
-                        embedding_ctx,
+                pending_papers.push((id, abstract_text));
+                if let Some(papers) = take_abstract_persist_batch(&mut pending_papers, false) {
+                    embed_and_persist_abstract_batch(
+                        table,
+                        papers,
+                        embedding_model,
+                        self.embedding_ctx,
                         &job_embedder,
+                        &self.index_jobs,
+                        &mut scanned,
+                        &mut embedded_count,
+                        &mut failed_count,
+                        &mut last_progress_update,
+                        paper_id.is_some(),
                     )
-                    .await;
-                    (group, vectors)
-                });
-            }
-            let mut batch_papers = Vec::new();
-            let mut batch_vectors = Vec::new();
-            while let Some(joined) = embedding_tasks.join_next().await {
-                let (group, vector_result) = joined?;
-                let group_len = group.len();
-                let current = group.last().map(|(id, _)| id.clone());
-                match vector_result {
-                    Ok(vectors) => {
-                        batch_papers.extend(group);
-                        batch_vectors.extend(vectors);
-                    }
-                    Err(error) => {
-                        failed_count += group.len();
-                        eprintln!("Abstract batch embedding failed: {error}");
-                        self.index_jobs
-                            .update(|progress| progress.error = Some(error.to_string()))
-                            .await;
-                    }
-                }
-                scanned += group_len;
-                if scanned % 100 < EMBEDDING_BATCH_SIZE
-                    || paper_id.is_some()
-                    || last_progress_update.elapsed().as_secs_f64() >= 1.0
-                {
-                    self.index_jobs
-                        .update(|progress| {
-                            progress.scanned_papers = scanned;
-                            progress.chunked_papers = 0;
-                            progress.embedded_papers = embedded_count;
-                            progress.failed_papers = failed_count;
-                            progress.current_paper = current;
-                        })
-                        .await;
-                    last_progress_update = Instant::now();
+                    .await?;
                 }
             }
-            if !batch_papers.is_empty() {
-                let write_started = Instant::now();
-                match crate::hybrid_pipeline::write_abstract_vectors(
-                    table,
-                    &batch_papers,
-                    batch_vectors,
-                    embedding_model,
-                )
-                .await
-                {
-                    Ok(count) => {
-                        embedded_count += count;
-                        eprintln!(
-                            "[abstract-index] persisted vectors={} elapsed_ms={}",
-                            count,
-                            write_started.elapsed().as_millis()
-                        );
-                    }
-                    Err(error) => {
-                        failed_count += batch_papers.len();
-                        eprintln!(
-                            "[abstract-index] vector write failed vectors={} elapsed_ms={}: {error}",
-                            batch_papers.len(),
-                            write_started.elapsed().as_millis()
-                        );
-                        self.index_jobs
-                            .update(|progress| progress.error = Some(error.to_string()))
-                            .await;
-                    }
-                }
-            }
+        }
+        if let Some(papers) = take_abstract_persist_batch(&mut pending_papers, true) {
+            embed_and_persist_abstract_batch(
+                table,
+                papers,
+                embedding_model,
+                self.embedding_ctx,
+                &job_embedder,
+                &self.index_jobs,
+                &mut scanned,
+                &mut embedded_count,
+                &mut failed_count,
+                &mut last_progress_update,
+                paper_id.is_some(),
+            )
+            .await?;
         }
         if paper_id.is_some() && scanned == 0 {
             return Err(format!(
@@ -3132,10 +3194,11 @@ fn validate_embedding_ctx(ctx: usize) -> Result<usize, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_EMBEDDING_CTX, IndexBuildProgress, IndexBuildProgressHub, IndexJobManager,
-        MAX_LFM_EMBEDDING_TOKENS, SEARCH_SNIPPET_CHARS, ensure_indexing_state_fields,
-        model_from_vector_column, pending_index_filter, search_excerpt, sql_string,
-        update_paper_index_state, validate_embedding_ctx,
+        ABSTRACT_PERSIST_BATCH_SIZE, DEFAULT_EMBEDDING_CTX, IndexBuildProgress,
+        IndexBuildProgressHub, IndexJobManager, MAX_LFM_EMBEDDING_TOKENS, SEARCH_SNIPPET_CHARS,
+        ensure_indexing_state_fields, model_from_vector_column, pending_index_filter,
+        search_excerpt, sql_string, take_abstract_persist_batch, update_paper_index_state,
+        validate_embedding_ctx,
     };
     use lancedb::{
         arrow::{
@@ -3164,6 +3227,29 @@ mod tests {
         let update = updates.recv().await.unwrap();
         assert_eq!(update.state, "completed");
         assert_eq!(update.stage, "Index committed");
+    }
+
+    #[test]
+    fn abstract_persistence_batches_across_small_input_batches() {
+        let mut pending = Vec::new();
+        for index in 0..ABSTRACT_PERSIST_BATCH_SIZE {
+            pending.push((index.to_string(), "abstract".to_owned()));
+            let batch = take_abstract_persist_batch(&mut pending, false);
+            if index + 1 < ABSTRACT_PERSIST_BATCH_SIZE {
+                assert!(batch.is_none());
+            } else {
+                assert_eq!(batch.unwrap().len(), ABSTRACT_PERSIST_BATCH_SIZE);
+            }
+        }
+        pending.push(("tail".to_owned(), "abstract".to_owned()));
+        assert!(take_abstract_persist_batch(&mut pending, false).is_none());
+        assert_eq!(
+            take_abstract_persist_batch(&mut pending, true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]
