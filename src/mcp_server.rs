@@ -560,6 +560,12 @@ struct SearchArgs {
         description = "Request ID returned by a previous page; continues that cached search"
     )]
     request_id: Option<String>,
+    #[schemars(description = "Response profile: compact (default) or web")]
+    profile: Option<String>,
+    #[schemars(
+        description = "Optional exact result fields; overrides profile. Fields: paper_id, snippet, snippet_truncated, metadata.title, metadata.authors, metadata.abstract, metadata.categories, metadata.primary_category, metadata.doi, metadata.journal_ref, metadata.license, embedding_vector_f16_bits, cosine_distance"
+    )]
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -588,6 +594,12 @@ struct EmbeddedSearchArgs {
         description = "Request ID returned by a previous page; continues that cached search"
     )]
     request_id: Option<String>,
+    #[schemars(description = "Response profile: compact (default) or web")]
+    profile: Option<String>,
+    #[schemars(
+        description = "Optional exact result fields; overrides profile. Fields: paper_id, snippet, snippet_truncated, metadata.title, metadata.authors, metadata.abstract, metadata.categories, metadata.primary_category, metadata.doi, metadata.journal_ref, metadata.license, embedding_vector_f16_bits, cosine_distance"
+    )]
+    fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -809,7 +821,7 @@ struct SearchRequestCache {
     model: String,
     scope: usize,
     result_set: Option<CachedSearchResultSet>,
-    pages: HashMap<(usize, usize), String>,
+    pages: HashMap<(usize, usize, String), String>,
 }
 
 struct CachedSearchResultSet {
@@ -1764,6 +1776,7 @@ impl ArxivMcpServer {
                 None,
             ));
         }
+        select_search_fields(args.profile.as_deref(), args.fields.as_deref())?;
         let page = args
             .page
             .or_else(|| args.offset.map(|offset| offset / page_size))
@@ -1836,7 +1849,14 @@ impl ArxivMcpServer {
                 lookup_time_ms: started_at.elapsed().as_millis() as u64,
             });
         }
-        cached_search_page(&request_id, &mut request_cache, page, page_size)
+        cached_search_page(
+            &request_id,
+            &mut request_cache,
+            page,
+            page_size,
+            args.profile.as_deref(),
+            args.fields.as_deref(),
+        )
     }
 
     #[tool(
@@ -1871,6 +1891,7 @@ impl ArxivMcpServer {
                 None,
             ));
         }
+        select_search_fields(args.profile.as_deref(), args.fields.as_deref())?;
         let page = args
             .page
             .or_else(|| args.offset.map(|offset| offset / page_size))
@@ -2051,7 +2072,14 @@ impl ArxivMcpServer {
         } else {
             eprintln!("[embedded-search] cache hit request_id={request_id}");
         }
-        cached_search_page(&request_id, &mut request_cache, page, page_size)
+        cached_search_page(
+            &request_id,
+            &mut request_cache,
+            page,
+            page_size,
+            args.profile.as_deref(),
+            args.fields.as_deref(),
+        )
     }
 
     #[tool(
@@ -3403,8 +3431,13 @@ fn cached_search_page(
     cache: &mut SearchRequestCache,
     page: usize,
     page_size: usize,
+    profile: Option<&str>,
+    fields: Option<&[String]>,
 ) -> Result<String, McpError> {
-    if let Some(cached) = cache.pages.get(&(page_size, page)) {
+    let selected_fields = select_search_fields(profile, fields)?;
+    let field_cache_key = selected_fields.join(",");
+    let cache_key = (page_size, page, field_cache_key);
+    if let Some(cached) = cache.pages.get(&cache_key) {
         return Ok(cached.clone());
     }
     let result_set = cache
@@ -3439,9 +3472,103 @@ fn cached_search_page(
         ),
         request_id: request_id.to_owned(),
     };
-    let serialized = serde_json::to_string_pretty(&response).map_err(internal_error)?;
-    cache.pages.insert((page_size, page), serialized.clone());
+    let mut serialized_response = serde_json::to_value(response).map_err(internal_error)?;
+    if let Some(results) = serialized_response
+        .get_mut("results")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        let top_level_fields = selected_fields
+            .iter()
+            .filter(|field| !field.starts_with("metadata."))
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let include_metadata = selected_fields
+            .iter()
+            .any(|field| field.starts_with("metadata."));
+        for result in results {
+            if let Some(object) = result.as_object_mut() {
+                object.retain(|key, _| {
+                    top_level_fields.contains(key.as_str())
+                        || (key == "metadata" && include_metadata)
+                });
+                if let Some(metadata) = object
+                    .get_mut("metadata")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    metadata.retain(|key, _| selected_fields.contains(&format!("metadata.{key}")));
+                }
+                if object
+                    .get("metadata")
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(serde_json::Map::is_empty)
+                {
+                    object.remove("metadata");
+                }
+            }
+        }
+    }
+    let serialized = serde_json::to_string_pretty(&serialized_response).map_err(internal_error)?;
+    cache.pages.insert(cache_key, serialized.clone());
     Ok(serialized)
+}
+
+fn select_search_fields(
+    profile: Option<&str>,
+    fields: Option<&[String]>,
+) -> Result<Vec<String>, McpError> {
+    const COMPACT_FIELDS: &[&str] = &[
+        "paper_id",
+        "snippet",
+        "metadata.title",
+        "metadata.authors",
+        "metadata.categories",
+        "metadata.primary_category",
+        "cosine_distance",
+    ];
+    const WEB_FIELDS: &[&str] = &[
+        "paper_id",
+        "snippet",
+        "snippet_truncated",
+        "metadata.title",
+        "metadata.authors",
+        "metadata.abstract",
+        "metadata.categories",
+        "metadata.primary_category",
+        "metadata.doi",
+        "metadata.journal_ref",
+        "metadata.license",
+        "embedding_vector_f16_bits",
+        "cosine_distance",
+    ];
+    const ALLOWED_FIELDS: &[&str] = WEB_FIELDS;
+
+    if let Some(fields) = fields {
+        let mut selected = Vec::with_capacity(fields.len());
+        for field in fields {
+            if !ALLOWED_FIELDS.contains(&field.as_str()) {
+                return Err(McpError::invalid_params(
+                    format!("unknown search result field: {field}"),
+                    None,
+                ));
+            }
+            if !selected.contains(field) {
+                selected.push(field.clone());
+            }
+        }
+        return Ok(selected);
+    }
+
+    let fields = match profile.unwrap_or("compact") {
+        "compact" => COMPACT_FIELDS,
+        "web" => WEB_FIELDS,
+        other => {
+            return Err(McpError::invalid_params(
+                format!("profile must be 'compact' or 'web', got '{other}'"),
+                None,
+            ));
+        }
+    };
+    Ok(fields.iter().map(|field| (*field).to_owned()).collect())
 }
 
 fn sql_string(value: &str) -> String {
@@ -3644,7 +3771,7 @@ mod tests {
         ABSTRACT_PERSIST_BATCH_SIZE, DEFAULT_EMBEDDING_CTX, IndexBuildProgress,
         IndexBuildProgressHub, IndexJobManager, MAX_LFM_EMBEDDING_TOKENS, SEARCH_SNIPPET_CHARS,
         cached_search_page, ensure_indexing_state_fields, model_from_vector_column,
-        pending_index_filter, search_excerpt, search_request_id, sql_string,
+        pending_index_filter, search_excerpt, search_request_id, select_search_fields, sql_string,
         take_abstract_persist_batch, update_paper_index_state, validate_embedding_ctx,
     };
     use lancedb::{
@@ -3698,7 +3825,7 @@ mod tests {
             pages: HashMap::new(),
         };
 
-        let page = cached_search_page("request-id", &mut cache, 1, 2).unwrap();
+        let page = cached_search_page("request-id", &mut cache, 1, 2, None, None).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&page).unwrap();
         assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
         assert_eq!(parsed["results"][0]["paper_id"], "paper-3");
@@ -3706,9 +3833,25 @@ mod tests {
         assert_eq!(parsed["metadata"]["total_results"], 3);
         assert!(!parsed["metadata"]["has_more"].as_bool().unwrap());
         assert_eq!(
-            cached_search_page("request-id", &mut cache, 1, 2).unwrap(),
+            cached_search_page("request-id", &mut cache, 1, 2, None, None).unwrap(),
             page
         );
+    }
+
+    #[test]
+    fn compact_search_profile_omits_large_diagnostic_fields() {
+        let compact = select_search_fields(None, None).unwrap();
+        assert!(compact.contains(&"paper_id".to_owned()));
+        assert!(compact.contains(&"metadata.title".to_owned()));
+        assert!(!compact.contains(&"embedding_vector_f16_bits".to_owned()));
+        assert!(!compact.contains(&"metadata.license".to_owned()));
+        assert!(
+            select_search_fields(Some("web"), None)
+                .unwrap()
+                .contains(&"embedding_vector_f16_bits".to_owned())
+        );
+        assert!(select_search_fields(None, Some(&["paper_id".to_owned()])).is_ok());
+        assert!(select_search_fields(None, Some(&["unknown".to_owned()])).is_err());
     }
 
     #[tokio::test]

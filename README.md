@@ -78,7 +78,12 @@ The database path and table names remain backend environment settings:
   the request. The page
   accepts `tool=search_full_text&query=...&limit=...&page_size=...&page=...` and
   `tool=get_paper_text&paper_id=...&max_chars=...` URL parameters to replay
-  those MCP requests. Responses include a deterministic BLAKE3 `request_id`
+  those MCP requests. Search responses default to the `compact` profile,
+  omitting large fields such as abstracts, licenses, and embedding vectors.
+  Use `profile=web` for all result fields, or pass an explicit `fields` list
+  such as `["paper_id","snippet","cosine_distance"]` to select exact result
+  fields. Pagination metadata and the request ID are always returned.
+  Responses include a deterministic BLAKE3 `request_id`
   keyed by query, mode, model, and search scope. The server caches the full
   scoped result set for 30 minutes and slices it for each `request_id`, `page`,
   and `page_size`; changing page size or page does not rerun the database

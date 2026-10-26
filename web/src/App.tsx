@@ -690,6 +690,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
               limit: requestScope,
               page_size: pageSize,
               page,
+              profile: "web",
               ...(requestId ? { request_id: requestId } : {}),
             }
           : {
@@ -697,6 +698,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
               limit: requestScope,
               page_size: pageSize,
               page,
+              profile: "web",
               ...(requestId ? { request_id: requestId } : {}),
             },
       }, undefined, { timeout: 180_000 });
