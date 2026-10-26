@@ -68,6 +68,13 @@ The database path and table names remain backend environment settings:
 
 ## Tools
 
+The MCP server searches only data currently loaded in its LanceDB tables; it
+may be a sample rather than the complete arXiv corpus. Use `dataset_status` to
+check loaded row counts. Before invoking any tool that writes embeddings or
+index state, or may create a missing vector index, ask the user and obtain
+explicit consent. Search and inspection requests alone do not imply consent
+for database changes.
+
 - `search_full_text(query, limit?, page_size?, page?, request_id?)`: full-text search, returning paper IDs and
   short snippets plus available title/author/category/DOI metadata.
   `limit` is the search scope (up to 1000 candidates). `page_size` controls
@@ -124,7 +131,11 @@ The database path and table names remain backend environment settings:
   applied to each underlying lexical/vector query before their results are
   fused.
 - `search_embedded_papers(query, embedding_model?, limit?, page_size?, page?,
-  semantic_only?, request_id?)`: `limit` is the database search scope (the UI
+  semantic_only?, request_id?)`: omit `embedding_model` to use
+  `google/embeddinggemma-300m`; set it only to search vectors from another
+  configured model. Hybrid lexical+semantic search is the default;
+  `semantic_only=true` uses vector-only search. An empty query browses papers
+  embedded for that model. `limit` is the database search scope (the UI
   offers 20, 100, and 1000); changing scope starts a separate request rather
   than extending or merging the previous result set. `page_size` controls only
   the number of cached hits sent over the wire (the UI offers 20, 50, and 100).

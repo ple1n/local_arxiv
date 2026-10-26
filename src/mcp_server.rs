@@ -575,7 +575,7 @@ struct EmbeddedSearchArgs {
     )]
     query: Option<String>,
     #[schemars(
-        description = "Embedding model whose non-null vectors define the searchable subset"
+        description = "Optional embedding model override. Omit to use google/embeddinggemma-300m; set only to search vectors from another configured model."
     )]
     embedding_model: Option<String>,
     #[schemars(description = "Database search scope, from 1 to 1000")]
@@ -604,7 +604,9 @@ struct EmbeddedSearchArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct AbstractIndexArgs {
-    #[schemars(description = "Embedding model whose abstract vector index is checked or built")]
+    #[schemars(
+        description = "Optional embedding model override. Omit to use google/embeddinggemma-300m; set only to check or build another configured model's index."
+    )]
     embedding_model: Option<String>,
 }
 
@@ -729,7 +731,7 @@ struct StartIndexJobArgs {
     #[schemars(description = "Embedding mode: abstract (default) or full_text")]
     mode: Option<String>,
     #[schemars(
-        description = "Embedding model ID from list_models; defaults to the Python embedding model"
+        description = "Optional embedding model override; omit to use google/embeddinggemma-300m, and set only to select another configured model"
     )]
     embedding_model: Option<String>,
 }
@@ -1860,7 +1862,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Browse papers with abstract embeddings, run hybrid lexical+semantic search, or use semantic-only search for a model. An empty query browses the embedded subset."
+        description = "Search papers by abstract vectors using hybrid lexical+semantic search (default) or semantic-only search; an empty query browses papers embedded for the selected model. Omit embedding_model to use google/embeddinggemma-300m; set it only to select another configured model. limit is the total candidate scope (up to 1000); page_size controls how many results are returned per page."
     )]
     async fn search_embedded_papers(
         &self,
@@ -1899,7 +1901,7 @@ impl ArxivMcpServer {
         let model = args
             .embedding_model
             .as_deref()
-            .unwrap_or(&self.embedding_model);
+            .unwrap_or(&self.python_embedding_model);
         let semantic_only = args.semantic_only.unwrap_or(false);
         if model.trim().is_empty() || model.len() > 512 {
             return Err(McpError::invalid_params("embedding_model is invalid", None));
@@ -2092,7 +2094,7 @@ impl ArxivMcpServer {
         let model = args
             .embedding_model
             .as_deref()
-            .unwrap_or(&self.embedding_model);
+            .unwrap_or(&self.python_embedding_model);
         if model != self.embedding_model && model != self.python_embedding_model {
             return Err(McpError::invalid_params(
                 "embedding_model must match a configured embedding provider",
@@ -2140,7 +2142,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Build or update the abstract vector index for the configured embedding model. This operation may take time and is separate from embedding."
+        description = "Build or update the abstract vector index for the configured embedding model. This modifies the database and may take time; ask the user and obtain explicit consent before building it."
     )]
     async fn build_abstract_vector_index(
         &self,
@@ -2149,7 +2151,7 @@ impl ArxivMcpServer {
         let model = args
             .embedding_model
             .as_deref()
-            .unwrap_or(&self.embedding_model);
+            .unwrap_or(&self.python_embedding_model);
         if model != self.embedding_model && model != self.python_embedding_model {
             return Err(McpError::invalid_params(
                 "embedding_model must match a configured embedding provider",
@@ -2355,7 +2357,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Queue indexing for one paper, or all papers not yet chunked and embedded. Progress is streamed from the backend."
+        description = "Writes embeddings and index state to LanceDB for one paper or all pending papers; may also build vector indexes. Ask the user and obtain explicit consent before starting this job. Progress is streamed from the backend."
     )]
     async fn start_indexing_job(
         &self,
@@ -2744,7 +2746,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Low-level embedding operation for up to 8 chunk IDs in a chunk table. Prefer start_indexing_job for resumable paper or corpus indexing."
+        description = "Writes embeddings for up to 8 chunk IDs in a chunk table. Ask the user and obtain explicit consent before modifying the database. Prefer start_indexing_job for resumable paper or corpus indexing."
     )]
     async fn embed_chunk_batch(
         &self,
@@ -2807,7 +2809,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Create the model-specific vector index after chunk embeddings have been persisted."
+        description = "Create the model-specific vector index after chunk embeddings have been persisted. This modifies the database; ask the user and obtain explicit consent before creating the index."
     )]
     async fn finalize_chunk_embeddings(
         &self,
@@ -2838,7 +2840,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Search chunks in a named LanceDB table using lexical and dense retrieval, reciprocal-rank fusion, and optional reranking."
+        description = "Search chunks in a named LanceDB table using lexical and dense retrieval, reciprocal-rank fusion, and optional reranking. If the required vector index is missing, this tool may create it; obtain explicit user consent before invoking it when index creation may be needed."
     )]
     async fn search_hybrid_chunks(
         &self,
@@ -2964,7 +2966,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "Index or resume a paper through the shared corpus pipeline, then test it with lexical, dense, reciprocal-rank-fusion, and optional reranking."
+        description = "Index or resume a paper in LanceDB, writing embedding and index state, then test it with lexical, dense, reciprocal-rank-fusion, and optional reranking. Ask the user and obtain explicit consent before invoking this database-modifying operation."
     )]
     async fn test_paper_chunks(
         &self,
@@ -3188,8 +3190,12 @@ impl ArxivMcpServer {
 impl ServerHandler for ArxivMcpServer {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "Search the locally ingested arXiv paper text with full-text search. \
-                 The current table may be a sample rather than the complete arXiv dataset.",
+            "Search the arXiv data currently loaded in the local LanceDB tables; this may be a sample, not the complete arXiv dataset. \
+                 Use search_full_text for lexical full-text search. Use search_embedded_papers for abstract-vector search: hybrid lexical+semantic is the default, and semantic_only=true requests vector-only ranking. \
+                 Omit embedding_model to use google/embeddinggemma-300m; set it only to search another configured model's vectors. \
+                 For embedded search, limit sets the total candidate scope (up to 1000), while page_size sets the number returned per page. \
+                 Use dataset_status to inspect the loaded table row counts. \
+                 Before any database-modifying operation, including embedding/indexing jobs, vector-index construction, or tools that may create a missing index, ask the user and obtain explicit consent. Do not infer consent from a request to search or inspect data.",
         )
     }
 }
