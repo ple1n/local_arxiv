@@ -47,6 +47,8 @@ pub struct HybridHit {
     pub semantic_rank: Option<usize>,
     pub fused_score: f32,
     pub rerank_score: Option<f32>,
+    pub embedding_vector_f16_bits: Option<Vec<u16>>,
+    pub cosine_distance: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -794,6 +796,7 @@ impl<'a> HybridPipeline<'a> {
         abstract_table_name: &str,
         query: &str,
         embedding_model: &str,
+        offset: usize,
         reranker: Option<&dyn Reranker>,
         candidate_limit: usize,
         ctx: usize,
@@ -807,8 +810,8 @@ impl<'a> HybridPipeline<'a> {
         if query.trim().is_empty() {
             return Err("hybrid search query must not be empty".into());
         }
-        if candidate_limit == 0 || candidate_limit > 100 {
-            return Err("candidate limit must be between 1 and 100".into());
+        if candidate_limit == 0 {
+            return Err("candidate limit must be greater than 0".into());
         }
         if embedder.model_name() != embedding_model {
             return Err(format!(
@@ -883,6 +886,7 @@ impl<'a> HybridPipeline<'a> {
             .query()
             .full_text_search(FullTextSearchQuery::new(query.to_owned()))
             .select(Select::columns(&["paper_id", "text"]))
+            .offset(offset)
             .limit(candidate_limit)
             .execute()
             .await?;
@@ -942,9 +946,11 @@ impl<'a> HybridPipeline<'a> {
                 .column(&vector_column)
                 .distance_type(DistanceType::Cosine)
                 .select(Select::columns(&["paper_id"]))
+                .offset(offset)
                 .limit(candidate_limit)
                 .execute()
                 .await?,
+            None,
         )
         .await?;
         let mut dense = dense;
@@ -981,7 +987,7 @@ impl<'a> HybridPipeline<'a> {
             if entry.lexical_rank.is_none() {
                 lexical_rank += 1;
                 entry.lexical_rank = Some(lexical_rank);
-                entry.fused_score += reciprocal_rank(lexical_rank);
+                entry.fused_score += reciprocal_rank(offset + lexical_rank);
             }
         }
         for (rank, hit) in dense.into_iter().enumerate() {
@@ -992,8 +998,8 @@ impl<'a> HybridPipeline<'a> {
                     text: hit.abstract_text,
                 })
             });
-            entry.semantic_rank = Some(rank + 1);
-            entry.fused_score += reciprocal_rank(rank + 1);
+            entry.semantic_rank = Some(offset + rank + 1);
+            entry.fused_score += reciprocal_rank(offset + rank + 1);
         }
 
         let mut hits: Vec<HybridHit> = fused.into_values().map(RankedHit::into_hit).collect();
@@ -1044,6 +1050,7 @@ impl<'a> HybridPipeline<'a> {
         abstract_table_name: &str,
         query: &str,
         embedding_model: &str,
+        offset: usize,
         candidate_limit: usize,
         ctx: usize,
         embedder: &dyn Embedder,
@@ -1051,8 +1058,8 @@ impl<'a> HybridPipeline<'a> {
         if query.trim().is_empty() {
             return Err("semantic search query must not be empty".into());
         }
-        if candidate_limit == 0 || candidate_limit > 100 {
-            return Err("candidate limit must be between 1 and 100".into());
+        if candidate_limit == 0 {
+            return Err("candidate limit must be greater than 0".into());
         }
         if embedder.model_name() != embedding_model {
             return Err(format!(
@@ -1107,10 +1114,12 @@ impl<'a> HybridPipeline<'a> {
                 .vector_search(query_vector.clone())?
                 .column(&vector_column)
                 .distance_type(DistanceType::Cosine)
-                .select(Select::columns(&["paper_id"]))
+                .select(Select::columns(&["paper_id", &vector_column]))
+                .offset(offset)
                 .limit(candidate_limit)
                 .execute()
                 .await?,
+            Some(&vector_column),
         )
         .await?;
         let paper_ids = dense
@@ -1126,14 +1135,22 @@ impl<'a> HybridPipeline<'a> {
                     .get(&hit.paper_id)
                     .cloned()
                     .ok_or_else(|| format!("metadata missing for {}", hit.paper_id))?;
+                let cosine_distance = hit
+                    .cosine_similarity(query_vector)
+                    .map(|similarity| 1.0 - similarity);
+                let embedding_vector_f16_bits = hit.vector_f16_bits.ok_or_else(|| {
+                    format!("vector search result missing vector for {}", hit.paper_id)
+                })?;
                 Ok(HybridHit {
                     chunk_id: hit.paper_id.clone(),
                     paper_id: hit.paper_id,
                     text,
                     lexical_rank: None,
-                    semantic_rank: Some(rank + 1),
+                    semantic_rank: Some(offset + rank + 1),
                     fused_score: reciprocal_rank(rank + 1),
                     rerank_score: None,
+                    embedding_vector_f16_bits: Some(embedding_vector_f16_bits),
+                    cosine_distance,
                 })
             })
             .collect::<PipelineResult<Vec<_>>>()?;
@@ -1582,6 +1599,8 @@ impl RankedHit {
             semantic_rank: self.semantic_rank,
             fused_score: self.fused_score,
             rerank_score: None,
+            embedding_vector_f16_bits: None,
+            cosine_distance: None,
         }
     }
 }
@@ -1623,10 +1642,26 @@ async fn collect_ranked(mut stream: SendableRecordBatchStream) -> PipelineResult
 struct AbstractRawHit {
     paper_id: String,
     abstract_text: String,
+    vector: Option<Vec<f32>>,
+    vector_f16_bits: Option<Vec<u16>>,
+}
+
+impl AbstractRawHit {
+    fn cosine_similarity(&self, query: &[f32]) -> Option<f32> {
+        let vector = self.vector.as_ref()?;
+        if vector.len() != query.len() {
+            return None;
+        }
+        let dot = query.iter().zip(vector).map(|(a, b)| a * b).sum::<f32>();
+        let query_norm = query.iter().map(|value| value * value).sum::<f32>().sqrt();
+        let vector_norm = vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+        (query_norm > 0.0 && vector_norm > 0.0).then_some(dot / (query_norm * vector_norm))
+    }
 }
 
 async fn collect_abstract_ranked(
     mut stream: SendableRecordBatchStream,
+    vector_column: Option<&str>,
 ) -> PipelineResult<Vec<AbstractRawHit>> {
     let mut hits = Vec::new();
     while let Some(batch) = stream.next().await {
@@ -1637,13 +1672,47 @@ async fn collect_abstract_ranked(
             .as_any()
             .downcast_ref::<StringArray>()
             .ok_or("paper_id must be a UTF-8 string")?;
+        let vectors = vector_column
+            .map(|column| {
+                let array = batch
+                    .column_by_name(column)
+                    .ok_or("query result is missing vector column")?
+                    .as_any()
+                    .downcast_ref::<FixedSizeListArray>()
+                    .ok_or("query vector column must be a fixed-size list")?;
+                let values = array
+                    .values()
+                    .as_any()
+                    .downcast_ref::<Float16Array>()
+                    .ok_or("query vector values must be float16")?;
+                Ok::<_, Box<dyn Error + Send + Sync>>((array, values))
+            })
+            .transpose()?;
         for row in 0..batch.num_rows() {
             if paper_ids.is_null(row) {
                 continue;
             }
+            let (vector, vector_f16_bits) = if let Some((array, values)) = vectors {
+                if array.is_null(row) {
+                    return Err("query result contains a null vector".into());
+                }
+                let dimensions = array.value_length() as usize;
+                let start = row * dimensions;
+                let f16_values = (0..dimensions)
+                    .map(|index| values.value(start + index))
+                    .collect::<Vec<_>>();
+                (
+                    Some(f16_values.iter().map(|value| value.to_f32()).collect()),
+                    Some(f16_values.iter().map(|value| value.to_bits()).collect()),
+                )
+            } else {
+                (None, None)
+            };
             hits.push(AbstractRawHit {
                 paper_id: paper_ids.value(row).to_owned(),
                 abstract_text: String::new(),
+                vector,
+                vector_f16_bits,
             });
         }
     }
@@ -2025,6 +2094,7 @@ mod tests {
                 "metadata_test",
                 "relevant",
                 "mock-embedding",
+                0,
                 None,
                 10,
                 32_768,
@@ -2058,6 +2128,7 @@ mod tests {
                 "metadata_test",
                 "relevant",
                 "mock-embedding",
+                0,
                 None,
                 10,
                 32_768,
@@ -2086,6 +2157,7 @@ mod tests {
                 "metadata_test",
                 "relevant",
                 "mock-embedding",
+                0,
                 10,
                 32_768,
                 &MockEmbedder,
@@ -2098,6 +2170,18 @@ mod tests {
             .expect("the semantically relevant paper should be returned");
         assert_eq!(semantic_paper_one.lexical_rank, None);
         assert_eq!(semantic_paper_one.semantic_rank, Some(1));
+        assert_eq!(
+            semantic_paper_one
+                .embedding_vector_f16_bits
+                .as_ref()
+                .map(Vec::len),
+            Some(2)
+        );
+        assert!(
+            semantic_paper_one
+                .cosine_distance
+                .is_some_and(|distance| distance.is_finite())
+        );
         assert!(
             semantic_result
                 .hits

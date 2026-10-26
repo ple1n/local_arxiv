@@ -70,7 +70,7 @@ The database path and table names remain backend environment settings:
 
 - `search_full_text(query, limit?, offset?)`: full-text search, returning paper IDs and
   short snippets plus available title/author/category/DOI metadata.
-  `limit` is capped at 10. The response includes `results` and `metadata`
+  `limit` supports up to 1000 results per page. The response includes `results` and `metadata`
   (`lookup_time_ms`, `result_count`, `offset`, `next_offset`, and `has_more`).
   It also includes `search_url`, a page URL that reproduces the request.
   Use `offset` with `limit` to paginate through matching results. The page
@@ -109,13 +109,25 @@ The database path and table names remain backend environment settings:
   abstract vectors (`abstract`, the default). Abstract mode does not require
   full-text chunks or chunk vectors. Abstract-mode
   candidates are fused with full-text lexical results by `paper_id`, then can
-  optionally be reranked.
+  optionally be reranked. In paginated embedded-paper search, the offset is
+  applied to each underlying lexical/vector query before their results are
+  fused.
+- `search_embedded_papers(query, embedding_model?, limit?, offset?,
+  semantic_only?)`: semantic-only results are page-local sorted by exact cosine
+  distance computed from each returned stored f16 vector and the query vector.
+  Each semantic hit includes its f16 vector bit patterns and cosine distance;
+  this exact distance is distinct from IVF-PQ's approximate candidate ranking.
 - `embed_chunk_batch(chunk_table, chunk_ids, model)`: embed and persist up to 8
   chunks in the selected model's vector column.
 - `finalize_chunk_embeddings(chunk_table, model)`: create the model-specific
   cosine vector index after embedding batches finish.
 - `embed_texts(texts)`: embed 1 to 8 document passages with the configured
-  Python model and return the model and vector dimensions.
+  Python model and return the normalized float32 embedding vectors.
+- `inspect_abstract_vectors(paper_ids, query?, embedding_model?)`: return the
+  already-stored f16 abstract vectors for 1 to 10 paper IDs as compact f16
+  bit patterns. If `query` is provided, embed it once and report direct
+  dot-product and cosine-similarity values against each stored vector; paper
+  vectors are read from LanceDB and are not recomputed.
 - `dataset_status()`: report the configured table and its row count.
 
 The paper reader's **Chunk paper** action previews chunk boundaries.

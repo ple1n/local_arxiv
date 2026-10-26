@@ -11,7 +11,9 @@ use axum::{
 use futures::{StreamExt, stream};
 use lancedb::{
     Table,
-    arrow::arrow_array::{Array, BooleanArray, LargeStringArray, StringArray},
+    arrow::arrow_array::{
+        Array, BooleanArray, FixedSizeListArray, Float16Array, LargeStringArray, StringArray,
+    },
     connect,
     index::{
         Index,
@@ -51,7 +53,7 @@ use tower_http::{
 
 const DEFAULT_DATABASE_PATH: &str = "./data/arxiv_lance";
 const DEFAULT_TABLE_NAME: &str = "arxiv_full_text";
-const MAX_SEARCH_RESULTS: usize = 10;
+const MAX_SEARCH_RESULTS: usize = 1_000;
 const SEARCH_SNIPPET_CHARS: usize = 600;
 const MAX_PAPER_CHARS: usize = 1_000_000;
 const DEFAULT_EMBEDDING_CTX: usize = 2048;
@@ -545,7 +547,7 @@ struct EmbeddingServiceConfig {
 struct SearchArgs {
     #[schemars(description = "Words or phrase to find in indexed paper text")]
     query: String,
-    #[schemars(description = "Maximum results to return, from 1 to 10; defaults to 5")]
+    #[schemars(description = "Maximum results to return, from 1 to 1000; defaults to 5")]
     limit: Option<usize>,
     #[schemars(description = "Number of matching results to skip; defaults to 0")]
     offset: Option<usize>,
@@ -561,7 +563,7 @@ struct EmbeddedSearchArgs {
         description = "Embedding model whose non-null vectors define the searchable subset"
     )]
     embedding_model: Option<String>,
-    #[schemars(description = "Maximum results to return, from 1 to 10")]
+    #[schemars(description = "Maximum results to return, from 1 to 1000")]
     limit: Option<usize>,
     #[schemars(description = "Number of results to skip")]
     offset: Option<usize>,
@@ -647,6 +649,18 @@ struct EmbedTextsArgs {
     texts: Vec<String>,
     #[schemars(description = "Optional model ID for the Python embedding server")]
     model: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct InspectAbstractVectorsArgs {
+    #[schemars(
+        description = "1 to 10 arXiv paper IDs whose stored abstract vectors should be returned"
+    )]
+    paper_ids: Vec<String>,
+    #[schemars(description = "Optional query to embed once and compare with each stored vector")]
+    query: Option<String>,
+    #[schemars(description = "Embedding model; defaults to the configured Python model")]
+    embedding_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -737,6 +751,8 @@ struct SearchHit {
     metadata: Option<PaperMetadata>,
     snippet: String,
     snippet_truncated: bool,
+    embedding_vector_f16_bits: Option<Vec<u16>>,
+    cosine_distance: Option<f32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1649,7 +1665,13 @@ impl ArxivMcpServer {
         if args.limit == Some(0) {
             return Err(McpError::invalid_params("limit must be at least 1", None));
         }
-        let limit = args.limit.unwrap_or(5).min(MAX_SEARCH_RESULTS);
+        let limit = args.limit.unwrap_or(5);
+        if limit > MAX_SEARCH_RESULTS {
+            return Err(McpError::invalid_params(
+                format!("limit must not exceed {MAX_SEARCH_RESULTS}"),
+                None,
+            ));
+        }
         let offset = args.offset.unwrap_or(0);
         let query_limit = limit
             .checked_add(1)
@@ -1689,6 +1711,8 @@ impl ArxivMcpServer {
                     metadata,
                     snippet,
                     snippet_truncated,
+                    embedding_vector_f16_bits: None,
+                    cosine_distance: None,
                 });
             }
             if has_more {
@@ -1730,9 +1754,15 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        let limit = args.limit.unwrap_or(10).min(MAX_SEARCH_RESULTS);
+        let limit = args.limit.unwrap_or(10);
         if limit == 0 {
             return Err(McpError::invalid_params("limit must be at least 1", None));
+        }
+        if limit > MAX_SEARCH_RESULTS {
+            return Err(McpError::invalid_params(
+                format!("limit must not exceed {MAX_SEARCH_RESULTS}"),
+                None,
+            ));
         }
         let offset = args.offset.unwrap_or(0);
         let model = args
@@ -1794,6 +1824,8 @@ impl ArxivMcpServer {
                         metadata,
                         snippet,
                         snippet_truncated: false,
+                        embedding_vector_f16_bits: None,
+                        cosine_distance: None,
                     });
                 }
             }
@@ -1811,7 +1843,7 @@ impl ArxivMcpServer {
             let mode = if semantic_only { "semantic" } else { "hybrid" };
             eprintln!(
                 "[embedded-search] {mode} pipeline started candidate_limit={}",
-                offset.saturating_add(limit).saturating_add(1).min(100)
+                limit + 1
             );
             let database = connect(&self.database_path)
                 .execute()
@@ -1824,13 +1856,16 @@ impl ArxivMcpServer {
                 },
             );
             let embedder = self.embedder(model)?;
-            let candidate_limit = offset.saturating_add(limit).saturating_add(1).min(100);
+            let candidate_limit = limit
+                .checked_add(1)
+                .ok_or_else(|| McpError::invalid_params("limit is too large", None))?;
             let hybrid = if semantic_only {
                 pipeline
                     .search_abstract_semantic(
                         &self.metadata_table.name(),
                         query,
                         model,
+                        offset,
                         candidate_limit,
                         self.embedding_ctx,
                         embedder.as_ref(),
@@ -1843,6 +1878,7 @@ impl ArxivMcpServer {
                         &self.metadata_table.name(),
                         query,
                         model,
+                        offset,
                         None,
                         candidate_limit,
                         self.embedding_ctx,
@@ -1856,8 +1892,17 @@ impl ArxivMcpServer {
                 hybrid_started.elapsed().as_millis(),
                 hybrid.hits.len()
             );
+            let mut page = hybrid.hits.into_iter().take(limit + 1).collect::<Vec<_>>();
+            if semantic_only {
+                page.sort_by(|left, right| {
+                    left.cosine_distance
+                        .unwrap_or(f32::INFINITY)
+                        .total_cmp(&right.cosine_distance.unwrap_or(f32::INFINITY))
+                        .then(left.paper_id.cmp(&right.paper_id))
+                });
+            }
             let mut hits = Vec::new();
-            for hit in hybrid.hits.into_iter().skip(offset).take(limit + 1) {
+            for hit in page {
                 let metadata = self.metadata_for_id(&hit.paper_id).await?;
                 let (snippet, snippet_truncated) =
                     search_excerpt(&hit.text, query, SEARCH_SNIPPET_CHARS);
@@ -1866,6 +1911,8 @@ impl ArxivMcpServer {
                     metadata,
                     snippet,
                     snippet_truncated,
+                    embedding_vector_f16_bits: hit.embedding_vector_f16_bits,
+                    cosine_distance: hit.cosine_distance,
                 });
             }
             let has_more = hits.len() > limit;
@@ -2380,6 +2427,184 @@ impl ArxivMcpServer {
             "model": model,
             "count": embeddings.len(),
             "dimensions": dimensions,
+            "normalization": "L2; cosine similarity equals dot product up to f16 storage rounding",
+            "embeddings": embeddings,
+        }))
+        .map_err(internal_error)
+    }
+
+    #[tool(
+        description = "Return already-stored abstract f16 vectors for paper IDs and optionally compute direct dot products and cosine similarities against one query embedding. Does not re-embed papers."
+    )]
+    async fn inspect_abstract_vectors(
+        &self,
+        Parameters(args): Parameters<InspectAbstractVectorsArgs>,
+    ) -> Result<String, McpError> {
+        if args.paper_ids.is_empty()
+            || args.paper_ids.len() > 10
+            || args
+                .paper_ids
+                .iter()
+                .any(|id| id.trim().is_empty() || id.len() > 256)
+        {
+            return Err(McpError::invalid_params(
+                "paper_ids must contain 1 to 10 non-empty paper IDs",
+                None,
+            ));
+        }
+        if args
+            .query
+            .as_ref()
+            .is_some_and(|query| query.trim().is_empty() || query.len() > 2_000)
+        {
+            return Err(McpError::invalid_params(
+                "query must be non-empty and at most 2000 bytes when provided",
+                None,
+            ));
+        }
+        let model = args
+            .embedding_model
+            .as_deref()
+            .unwrap_or(&self.python_embedding_model);
+        if model != self.embedding_model && model != self.python_embedding_model {
+            return Err(McpError::invalid_params(
+                "embedding_model must match a configured embedding provider",
+                None,
+            ));
+        }
+        let vector_column = crate::hybrid_pipeline::vector_column_name(model);
+        let escaped_ids = args
+            .paper_ids
+            .iter()
+            .map(|id| sql_string(id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut rows = self
+            .metadata_table
+            .query()
+            .only_if(format!("paper_id IN ({escaped_ids})"))
+            .select(Select::columns(&["paper_id", &vector_column]))
+            .execute()
+            .await
+            .map_err(internal_error)?;
+        let mut stored = HashMap::new();
+        while let Some(batch) = rows.next().await {
+            let batch = batch.map_err(internal_error)?;
+            let ids = batch
+                .column_by_name("paper_id")
+                .ok_or_else(|| internal_error("metadata table is missing paper_id"))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| internal_error("paper_id must be a UTF-8 string"))?;
+            let vectors = batch
+                .column_by_name(&vector_column)
+                .ok_or_else(|| internal_error("metadata table is missing the vector column"))?
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| internal_error("stored vectors must be fixed-size lists"))?;
+            let values = vectors
+                .values()
+                .as_any()
+                .downcast_ref::<Float16Array>()
+                .ok_or_else(|| internal_error("stored vector values must be float16"))?;
+            let dimensions = vectors.value_length() as usize;
+            for row in 0..batch.num_rows() {
+                if ids.is_null(row) || vectors.is_null(row) {
+                    continue;
+                }
+                let start = row * dimensions;
+                let vector_f16 = (0..dimensions)
+                    .map(|index| values.value(start + index))
+                    .collect::<Vec<_>>();
+                let vector_f16_bits = vector_f16
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>();
+                let vector_f32 = vector_f16
+                    .iter()
+                    .map(|value| value.to_f32())
+                    .collect::<Vec<_>>();
+                stored.insert(ids.value(row).to_owned(), (vector_f32, vector_f16_bits));
+            }
+        }
+        for id in &args.paper_ids {
+            if !stored.contains_key(id) {
+                return Err(internal_error(format!(
+                    "no stored vector found for paper ID {id:?} in model {model:?}"
+                )));
+            }
+        }
+        let query_vector = if let Some(query) = args.query.as_deref() {
+            let embeddings = self
+                .embedder(model)?
+                .embed(
+                    &[query.to_owned()],
+                    crate::test_pipeline::EmbeddingTask::Query,
+                    self.embedding_ctx,
+                )
+                .await
+                .map_err(internal_error)?;
+            Some(
+                embeddings
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| internal_error("embedding service returned no query vector"))?,
+            )
+        } else {
+            None
+        };
+        if let Some(query_vector) = &query_vector {
+            if query_vector.iter().any(|value| !value.is_finite()) {
+                return Err(internal_error("query vector contains non-finite values"));
+            }
+        }
+        let results = args
+            .paper_ids
+            .iter()
+            .map(|id| {
+                let (vector, vector_f16_bits) =
+                    stored.get(id).expect("requested IDs were validated");
+                if let Some(query_vector) = &query_vector {
+                    if query_vector.len() != vector.len() {
+                        return Err(internal_error(format!(
+                            "query dimension {} does not match stored vector dimension {}",
+                            query_vector.len(),
+                            vector.len()
+                        )));
+                    }
+                }
+                let (dot_product, cosine_similarity) = query_vector
+                    .as_ref()
+                    .map(|query| {
+                        let dot = query.iter().zip(vector).map(|(a, b)| a * b).sum::<f32>();
+                        let query_norm =
+                            query.iter().map(|value| value * value).sum::<f32>().sqrt();
+                        let vector_norm =
+                            vector.iter().map(|value| value * value).sum::<f32>().sqrt();
+                        let cosine = if query_norm == 0.0 || vector_norm == 0.0 {
+                            None
+                        } else {
+                            Some(dot / (query_norm * vector_norm))
+                        };
+                        (Some(dot), cosine)
+                    })
+                    .unwrap_or((None, None));
+                Ok(serde_json::json!({
+                    "paper_id": id,
+                    "dimensions": vector.len(),
+                    "stored_vector_f16_bits": vector_f16_bits,
+                    "dot_product": dot_product,
+                    "cosine_similarity": cosine_similarity,
+                }))
+            })
+            .collect::<Result<Vec<_>, McpError>>()?;
+        serde_json::to_string_pretty(&serde_json::json!({
+            "embedding_model": model,
+            "stored_vector_dtype": "float16",
+            "query_vector": query_vector,
+            "query_vector_dtype": query_vector.as_ref().map(|_| "float32"),
+            "results": results,
+            "math_note": "Dot product and cosine are computed over returned f16-stored vectors promoted to f32; query embedding is computed once.",
         }))
         .map_err(internal_error)
     }
@@ -2581,6 +2806,7 @@ impl ArxivMcpServer {
                     &metadata_table_name,
                     query,
                     embedding_model,
+                    0,
                     reranker,
                     candidate_limit,
                     ctx,

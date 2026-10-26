@@ -20,6 +20,8 @@ type SearchHit = {
   metadata?: PaperMetadata | null;
   snippet: string;
   snippet_truncated: boolean;
+  embedding_vector_f16_bits?: number[];
+  cosine_distance?: number | null;
 };
 
 type SearchResponse = {
@@ -130,6 +132,8 @@ type ModelChoices = {
 };
 
 type EmbeddingMode = "full_text" | "abstract";
+type ResultsPerPage = 20 | 100 | 1000;
+const RESULTS_PER_PAGE_OPTIONS: ResultsPerPage[] = [20, 100, 1000];
 
 type QueryPipelineResponse = {
   embedding_model: string;
@@ -153,6 +157,15 @@ function getText(result: { content: Array<{ type: string; text?: string }>; isEr
     .filter((item) => item.type === "text")
     .map((item) => item.text ?? "")
     .join("\n");
+}
+
+function f16BitsToNumber(bits: number): number {
+  const sign = bits & 0x8000 ? -1 : 1;
+  const exponent = (bits >> 10) & 0x1f;
+  const fraction = bits & 0x03ff;
+  if (exponent === 0) return sign * 2 ** -14 * (fraction / 1024);
+  if (exponent === 0x1f) return fraction === 0 ? sign * Infinity : NaN;
+  return sign * 2 ** (exponent - 15) * (1 + fraction / 1024);
 }
 
 function HighlightText({ text, query }: { text: string; query: string }) {
@@ -444,6 +457,10 @@ const paperCss = `
 
 function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const initialParams = new URLSearchParams(window.location.search);
+  const requestedPageSize = Number.parseInt(initialParams.get("limit") ?? "", 10);
+  const initialPageSize = RESULTS_PER_PAGE_OPTIONS.includes(requestedPageSize as ResultsPerPage)
+    ? requestedPageSize as ResultsPerPage
+    : 20;
   const serverAddress = new URL(apiBaseUrl).host;
   const clientRef = useRef<Client | null>(null);
   const transportRef = useRef<StreamableHTTPClientTransport | null>(null);
@@ -460,6 +477,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       ? initialParams.get("embedded_only") === "1"
       : initialParams.get("semantic") === "1",
   );
+  const [pageSize, setPageSize] = useState<ResultsPerPage>(initialPageSize);
   const [searchUrl, setSearchUrl] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
   const [lookupTimeMs, setLookupTimeMs] = useState<number | null>(null);
@@ -588,7 +606,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             await fetchSearchPage(
               Number.parseInt(initialParams.get("offset") ?? "0", 10) || 0,
               false,
-              Number.parseInt(initialParams.get("limit") ?? "10", 10) || 10,
+              pageSize,
               false,
             );
           } else if (tool === "get_paper_text" && initialParams.get("paper_id")) {
@@ -619,7 +637,12 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
     };
   }, [apiBaseUrl, serverAddress]);
 
-  async function fetchSearchPage(offset: number, append: boolean, limit = 10, updateUrl = true) {
+  async function fetchSearchPage(
+    offset: number,
+    append: boolean,
+    limit = pageSize,
+    updateUrl = true,
+  ) {
     const client = clientRef.current;
     const searchQuery = query.trim();
     const searchMode = lexicalSearch
@@ -646,7 +669,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       const searchResponse = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
       ) as SearchResponse;
-      setHits((current) => append ? [...current, ...searchResponse.results] : searchResponse.results);
+      const resultHits = searchResponse.results;
+      setHits((current) => append ? [...current, ...resultHits] : resultHits);
       setLookupTimeMs(searchResponse.metadata.lookup_time_ms);
       setNextOffset(searchResponse.metadata.next_offset);
       setHasMore(searchResponse.metadata.has_more);
@@ -1122,6 +1146,24 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
         </form>
         <div className="search-note">
           <span>Local index · Search results include matching text and metadata</span>
+          <div className="page-size-control" role="group" aria-label="Results per page">
+            <span>Results per page</span>
+            {RESULTS_PER_PAGE_OPTIONS.map((size) => (
+              <button
+                key={size}
+                type="button"
+                className="page-size-button"
+                aria-pressed={pageSize === size}
+                disabled={busy}
+                onClick={() => {
+                  setPageSize(size);
+                  void fetchSearchPage(0, false, size);
+                }}
+              >
+                {size}
+              </button>
+            ))}
+          </div>
           <label className="render-toggle">
             <input
               type="checkbox"
@@ -1264,6 +1306,22 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                   <p className="abstract"><LatexSnippet source={hit.metadata.abstract} query={query} renderLatex={renderLatex} /></p>
                 )}
                 <div className="snippet"><LatexSnippet source={hit.snippet} query={query} renderLatex={renderLatex} /></div>
+                {hit.embedding_vector_f16_bits && (
+                  <details className="embedding-inspection">
+                    <summary>
+                      Vector diagnostics
+                      {hit.cosine_distance !== null && hit.cosine_distance !== undefined &&
+                        ` · cosine distance ${hit.cosine_distance.toFixed(6)}`}
+                    </summary>
+                    <p>
+                      Exact cosine distance from stored f16 vector; not the IVF-PQ approximate
+                      ranking distance. Values are sent as compact f16 bit patterns.
+                    </p>
+                    <code>[{hit.embedding_vector_f16_bits
+                      .map((bits) => Number(f16BitsToNumber(bits).toPrecision(6)))
+                      .join(", ")}]</code>
+                  </details>
+                )}
                 <div className="card-footer">
                   <span className="category">Category: {hit.metadata?.primary_category || hit.metadata?.categories || "unavailable"}</span>
                   {hit.metadata?.journal_ref && <span>Journal: {hit.metadata.journal_ref}</span>}
