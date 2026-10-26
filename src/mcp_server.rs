@@ -45,7 +45,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokenizers::Tokenizer;
-use tokio::sync::{Notify, RwLock, Semaphore, broadcast};
+use tokio::sync::{Mutex, Notify, RwLock, Semaphore, broadcast};
 use tower_http::{
     cors::{Any, CorsLayer},
     services::ServeDir,
@@ -61,6 +61,7 @@ const MAX_LFM_EMBEDDING_TOKENS: usize = 512;
 const DEFAULT_CHUNK_TOKEN_BUDGET: usize =
     MAX_LFM_EMBEDDING_TOKENS - crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM;
 const ABSTRACT_PERSIST_BATCH_SIZE: usize = 1024;
+const SEARCH_REQUEST_CACHE_TTL: Duration = Duration::from_secs(30 * 60);
 
 static NEXT_INDEX_JOB_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -547,10 +548,18 @@ struct EmbeddingServiceConfig {
 struct SearchArgs {
     #[schemars(description = "Words or phrase to find in indexed paper text")]
     query: String,
-    #[schemars(description = "Maximum results to return, from 1 to 1000; defaults to 5")]
+    #[schemars(description = "Database search scope, from 1 to 1000; defaults to 5")]
     limit: Option<usize>,
-    #[schemars(description = "Number of matching results to skip; defaults to 0")]
+    #[schemars(description = "Zero-based result page; defaults to 0")]
+    page: Option<usize>,
+    #[schemars(description = "Number of results sent in one page; defaults to the search scope")]
+    page_size: Option<usize>,
+    #[schemars(description = "Legacy result offset, converted to a page index")]
     offset: Option<usize>,
+    #[schemars(
+        description = "Request ID returned by a previous page; continues that cached search"
+    )]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -563,14 +572,22 @@ struct EmbeddedSearchArgs {
         description = "Embedding model whose non-null vectors define the searchable subset"
     )]
     embedding_model: Option<String>,
-    #[schemars(description = "Maximum results to return, from 1 to 1000")]
+    #[schemars(description = "Database search scope, from 1 to 1000")]
     limit: Option<usize>,
-    #[schemars(description = "Number of results to skip")]
+    #[schemars(description = "Zero-based result page; defaults to 0")]
+    page: Option<usize>,
+    #[schemars(description = "Number of results sent in one page; defaults to the search scope")]
+    page_size: Option<usize>,
+    #[schemars(description = "Legacy result offset, converted to a page index")]
     offset: Option<usize>,
     #[schemars(
         description = "Use semantic-only abstract-vector search instead of hybrid lexical and semantic search"
     )]
     semantic_only: Option<bool>,
+    #[schemars(
+        description = "Request ID returned by a previous page; continues that cached search"
+    )]
+    request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -745,7 +762,7 @@ struct AvailableModelsResponse {
     reranking: Vec<AvailableModel>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct SearchHit {
     paper_id: String,
     metadata: Option<PaperMetadata>,
@@ -760,6 +777,7 @@ struct SearchResponse {
     results: Vec<SearchHit>,
     metadata: SearchMetadata,
     search_url: String,
+    request_id: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -769,6 +787,7 @@ struct SearchMetadata {
     offset: usize,
     next_offset: usize,
     has_more: bool,
+    total_results: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -782,6 +801,26 @@ struct PaperMetadata {
     doi: Option<String>,
     journal_ref: Option<String>,
     license: Option<String>,
+}
+
+struct SearchRequestCache {
+    mode: String,
+    query: String,
+    model: String,
+    scope: usize,
+    result_set: Option<CachedSearchResultSet>,
+    pages: HashMap<(usize, usize), String>,
+}
+
+struct CachedSearchResultSet {
+    results: Vec<SearchHit>,
+    search_url: String,
+    lookup_time_ms: u64,
+}
+
+struct SearchRequestEntry {
+    created_at: Instant,
+    cache: Arc<Mutex<SearchRequestCache>>,
 }
 
 #[derive(Clone)]
@@ -805,6 +844,7 @@ struct ArxivMcpServer {
     embedding_max_tokens: usize,
     index_jobs: IndexJobManager,
     index_build_progress: IndexBuildProgressHub,
+    search_requests: Arc<RwLock<HashMap<String, SearchRequestEntry>>>,
     #[expect(dead_code, reason = "tool_handler macro reads this router")]
     tool_router: ToolRouter<Self>,
 }
@@ -857,8 +897,53 @@ impl ArxivMcpServer {
             embedding_max_tokens: embedding.max_tokens,
             index_jobs,
             index_build_progress,
+            search_requests: Arc::new(RwLock::new(HashMap::new())),
             tool_router: Self::tool_router(),
         }
+    }
+
+    async fn search_request_cache(
+        &self,
+        mode: &str,
+        query: &str,
+        model: &str,
+        scope: usize,
+        requested_id: Option<&str>,
+    ) -> Result<(String, Arc<Mutex<SearchRequestCache>>), McpError> {
+        let request_id = search_request_id(mode, query, model, scope)?;
+        if requested_id.is_some_and(|requested_id| requested_id != request_id) {
+            return Err(McpError::invalid_params(
+                "request_id does not match the search parameters",
+                None,
+            ));
+        }
+
+        let now = Instant::now();
+        let mut requests = self.search_requests.write().await;
+        requests.retain(|_, entry| now.duration_since(entry.created_at) < SEARCH_REQUEST_CACHE_TTL);
+        let entry = requests.entry(request_id.clone()).or_insert_with(|| {
+            let created_at = Instant::now();
+            SearchRequestEntry {
+                created_at,
+                cache: Arc::new(Mutex::new(SearchRequestCache {
+                    mode: mode.to_owned(),
+                    query: query.to_owned(),
+                    model: model.to_owned(),
+                    scope,
+                    result_set: None,
+                    pages: HashMap::new(),
+                })),
+            }
+        });
+        if requested_id.is_some() {
+            if entry.cache.lock().await.result_set.is_none() {
+                return Err(McpError::invalid_params(
+                    "search request context has expired; start a new search",
+                    None,
+                ));
+            }
+        }
+        Ok((request_id, entry.cache.clone()))
     }
 
     fn embedder(&self, model: &str) -> Result<Box<dyn Embedder>, McpError> {
@@ -1672,71 +1757,86 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        let offset = args.offset.unwrap_or(0);
-        let query_limit = limit
-            .checked_add(1)
-            .ok_or_else(|| McpError::invalid_params("limit is too large", None))?;
-        let mut stream = self
-            .table
-            .query()
-            .full_text_search(FullTextSearchQuery::new(query.to_owned()))
-            .select(Select::columns(&["paper_id", "text"]))
-            .limit(query_limit)
-            .offset(offset)
-            .execute()
-            .await
-            .map_err(internal_error)?;
-
-        let mut hits = Vec::new();
-        let mut has_more = false;
-        while let Some(batch) = stream.next().await {
-            let batch = batch.map_err(internal_error)?;
-            for row in 0..batch.num_rows() {
-                if hits.len() == limit {
-                    has_more = true;
-                    break;
-                }
-                let paper_id = string_value(batch.column(0).as_ref(), row)
-                    .map_err(internal_error)?
-                    .unwrap_or_default();
-                let text = string_value(batch.column(1).as_ref(), row)
-                    .map_err(internal_error)?
-                    .unwrap_or_default();
-                let (snippet, snippet_truncated) =
-                    search_excerpt(text, query, SEARCH_SNIPPET_CHARS);
-                let paper_id = paper_id.to_owned();
-                let metadata = self.metadata_for_id(&paper_id).await?;
-                hits.push(SearchHit {
-                    paper_id,
-                    metadata,
-                    snippet,
-                    snippet_truncated,
-                    embedding_vector_f16_bits: None,
-                    cosine_distance: None,
-                });
-            }
-            if has_more {
-                break;
-            }
+        let page_size = args.page_size.unwrap_or(limit);
+        if page_size == 0 || page_size > MAX_SEARCH_RESULTS {
+            return Err(McpError::invalid_params(
+                format!("page_size must be between 1 and {MAX_SEARCH_RESULTS}"),
+                None,
+            ));
         }
-        let next_offset = offset
-            .checked_add(hits.len())
-            .ok_or_else(|| McpError::invalid_params("offset is too large", None))?;
-        let response = SearchResponse {
-            search_url: format!(
-                "/?tool=search_full_text&query={}&limit={limit}&offset={offset}",
-                Self::encode_query_parameter(query)
-            ),
-            metadata: SearchMetadata {
+        let page = args
+            .page
+            .or_else(|| args.offset.map(|offset| offset / page_size))
+            .unwrap_or(0);
+        let (request_id, request_cache) = self
+            .search_request_cache("lexical", query, "", limit, args.request_id.as_deref())
+            .await?;
+        let mut request_cache = request_cache.lock().await;
+        if request_cache.mode != "lexical"
+            || request_cache.query != query
+            || !request_cache.model.is_empty()
+            || request_cache.scope != limit
+        {
+            return Err(internal_error(
+                "search request context does not match its key",
+            ));
+        }
+        if request_cache.result_set.is_none() {
+            let mut stream = self
+                .table
+                .query()
+                .full_text_search(FullTextSearchQuery::new(query.to_owned()))
+                .select(Select::columns(&["paper_id", "text"]))
+                .limit(limit)
+                .offset(0)
+                .execute()
+                .await
+                .map_err(internal_error)?;
+            let mut raw_hits = Vec::new();
+            while let Some(batch) = stream.next().await {
+                let batch = batch.map_err(internal_error)?;
+                for row in 0..batch.num_rows() {
+                    let paper_id = string_value(batch.column(0).as_ref(), row)
+                        .map_err(internal_error)?
+                        .unwrap_or_default()
+                        .to_owned();
+                    let text = string_value(batch.column(1).as_ref(), row)
+                        .map_err(internal_error)?
+                        .unwrap_or_default()
+                        .to_owned();
+                    raw_hits.push((paper_id, text));
+                }
+            }
+            let paper_ids = raw_hits
+                .iter()
+                .map(|(paper_id, _)| paper_id.clone())
+                .collect::<Vec<_>>();
+            let metadata = self.metadata_for_ids(&paper_ids).await?;
+            let results = raw_hits
+                .into_iter()
+                .map(|(paper_id, text)| {
+                    let (snippet, snippet_truncated) =
+                        search_excerpt(&text, query, SEARCH_SNIPPET_CHARS);
+                    SearchHit {
+                        metadata: metadata.get(&paper_id).cloned(),
+                        paper_id,
+                        snippet,
+                        snippet_truncated,
+                        embedding_vector_f16_bits: None,
+                        cosine_distance: None,
+                    }
+                })
+                .collect();
+            request_cache.result_set = Some(CachedSearchResultSet {
+                results,
+                search_url: format!(
+                    "/?tool=search_full_text&query={}&limit={limit}",
+                    Self::encode_query_parameter(query)
+                ),
                 lookup_time_ms: started_at.elapsed().as_millis() as u64,
-                result_count: hits.len(),
-                offset,
-                next_offset,
-                has_more,
-            },
-            results: hits,
-        };
-        serde_json::to_string_pretty(&response).map_err(internal_error)
+            });
+        }
+        cached_search_page(&request_id, &mut request_cache, page, page_size)
     }
 
     #[tool(
@@ -1764,7 +1864,17 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        let offset = args.offset.unwrap_or(0);
+        let page_size = args.page_size.unwrap_or(limit);
+        if page_size == 0 || page_size > MAX_SEARCH_RESULTS {
+            return Err(McpError::invalid_params(
+                format!("page_size must be between 1 and {MAX_SEARCH_RESULTS}"),
+                None,
+            ));
+        }
+        let page = args
+            .page
+            .or_else(|| args.offset.map(|offset| offset / page_size))
+            .unwrap_or(0);
         let model = args
             .embedding_model
             .as_deref()
@@ -1773,185 +1883,175 @@ impl ArxivMcpServer {
         if model.trim().is_empty() || model.len() > 512 {
             return Err(McpError::invalid_params("embedding_model is invalid", None));
         }
-        let ready_column = crate::hybrid_pipeline::embedding_ready_column_name(model);
-        eprintln!(
-            "[embedded-search] start mode={} model={model:?} query_chars={} offset={offset} limit={limit}",
-            if query.is_empty() {
-                "browse"
-            } else if semantic_only {
-                "semantic"
-            } else {
-                "hybrid"
-            },
-            query.chars().count()
-        );
-        self.metadata_table
-            .schema()
-            .await
-            .map_err(internal_error)?
-            .field_with_name(&ready_column)
-            .map_err(internal_error)?;
-
-        let (results, has_more) = if query.is_empty() {
-            let browse_started = Instant::now();
-            eprintln!("[embedded-search] browse query started readiness_column={ready_column}");
-            let mut rows = self
-                .metadata_table
-                .query()
-                .only_if(format!("{ready_column} = true"))
-                .select(Select::columns(&["paper_id", "abstract"]))
-                .limit(limit.saturating_add(1))
-                .offset(offset)
-                .execute()
+        let mode = if query.is_empty() {
+            "browse"
+        } else if semantic_only {
+            "semantic"
+        } else {
+            "hybrid"
+        };
+        let (request_id, request_cache) = self
+            .search_request_cache(mode, query, model, limit, args.request_id.as_deref())
+            .await?;
+        let mut request_cache = request_cache.lock().await;
+        if request_cache.mode != mode
+            || request_cache.query != query
+            || request_cache.model != model
+            || request_cache.scope != limit
+        {
+            return Err(internal_error(
+                "search request context does not match its key",
+            ));
+        }
+        if request_cache.result_set.is_none() {
+            let ready_column = crate::hybrid_pipeline::embedding_ready_column_name(model);
+            eprintln!(
+                "[embedded-search] start request_id={request_id} mode={mode} scope={limit} model={model:?} query_chars={}",
+                query.chars().count()
+            );
+            self.metadata_table
+                .schema()
                 .await
+                .map_err(internal_error)?
+                .field_with_name(&ready_column)
                 .map_err(internal_error)?;
-            let mut hits = Vec::new();
-            let mut scanned_rows = 0usize;
-            while let Some(batch) = rows.next().await {
-                let batch = batch.map_err(internal_error)?;
-                scanned_rows += batch.num_rows();
-                for row in 0..batch.num_rows() {
-                    let paper_id = string_at(&batch, "paper_id", row)
-                        .map_err(internal_error)?
-                        .ok_or_else(|| internal_error("embedded metadata row has null paper_id"))?;
-                    let snippet = string_at(&batch, "abstract", row)
-                        .map_err(internal_error)?
-                        .unwrap_or_default()
-                        .to_owned();
-                    let metadata = self.metadata_for_id(&paper_id).await?;
-                    hits.push(SearchHit {
+
+            let results = if query.is_empty() {
+                let mut rows = self
+                    .metadata_table
+                    .query()
+                    .only_if(format!("{ready_column} = true"))
+                    .select(Select::columns(&["paper_id", "abstract"]))
+                    .limit(limit)
+                    .offset(0)
+                    .execute()
+                    .await
+                    .map_err(internal_error)?;
+                let mut raw_hits = Vec::new();
+                while let Some(batch) = rows.next().await {
+                    let batch = batch.map_err(internal_error)?;
+                    for row in 0..batch.num_rows() {
+                        let paper_id = string_at(&batch, "paper_id", row)
+                            .map_err(internal_error)?
+                            .ok_or_else(|| {
+                                internal_error("embedded metadata row has null paper_id")
+                            })?
+                            .to_owned();
+                        let abstract_text = string_at(&batch, "abstract", row)
+                            .map_err(internal_error)?
+                            .unwrap_or_default()
+                            .to_owned();
+                        raw_hits.push((paper_id, abstract_text));
+                    }
+                }
+                let ids = raw_hits
+                    .iter()
+                    .map(|(paper_id, _)| paper_id.clone())
+                    .collect::<Vec<_>>();
+                let metadata = self.metadata_for_ids(&ids).await?;
+                raw_hits
+                    .into_iter()
+                    .map(|(paper_id, abstract_text)| SearchHit {
+                        metadata: metadata.get(&paper_id).cloned(),
                         paper_id,
-                        metadata,
-                        snippet,
+                        snippet: abstract_text,
                         snippet_truncated: false,
                         embedding_vector_f16_bits: None,
                         cosine_distance: None,
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                let database = connect(&self.database_path)
+                    .execute()
+                    .await
+                    .map_err(internal_error)?;
+                let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
+                    &database,
+                    crate::hybrid_pipeline::TableNames {
+                        chunks: crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE.to_owned(),
+                    },
+                );
+                let embedder = self.embedder(model)?;
+                let hybrid = if semantic_only {
+                    pipeline
+                        .search_abstract_semantic(
+                            &self.metadata_table.name(),
+                            query,
+                            model,
+                            0,
+                            limit,
+                            self.embedding_ctx,
+                            embedder.as_ref(),
+                        )
+                        .await
+                } else {
+                    pipeline
+                        .search_abstract(
+                            &self.table,
+                            &self.metadata_table.name(),
+                            query,
+                            model,
+                            0,
+                            None,
+                            limit,
+                            self.embedding_ctx,
+                            embedder.as_ref(),
+                        )
+                        .await
+                }
+                .map_err(internal_error)?;
+                let mut dense_hits = hybrid.hits;
+                if semantic_only {
+                    dense_hits.sort_by(|left, right| {
+                        left.cosine_distance
+                            .unwrap_or(f32::INFINITY)
+                            .total_cmp(&right.cosine_distance.unwrap_or(f32::INFINITY))
+                            .then(left.paper_id.cmp(&right.paper_id))
                     });
                 }
-            }
-            let has_more = hits.len() > limit;
-            hits.truncate(limit);
-            eprintln!(
-                "[embedded-search] browse query complete elapsed_ms={} rows={} returned={} has_more={has_more}",
-                browse_started.elapsed().as_millis(),
-                scanned_rows,
-                hits.len()
-            );
-            (hits, has_more)
-        } else {
-            let hybrid_started = Instant::now();
-            let mode = if semantic_only { "semantic" } else { "hybrid" };
-            eprintln!(
-                "[embedded-search] {mode} pipeline started candidate_limit={}",
-                limit + 1
-            );
-            let database = connect(&self.database_path)
-                .execute()
-                .await
-                .map_err(internal_error)?;
-            let pipeline = crate::hybrid_pipeline::HybridPipeline::new(
-                &database,
-                crate::hybrid_pipeline::TableNames {
-                    chunks: crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE.to_owned(),
-                },
-            );
-            let embedder = self.embedder(model)?;
-            let candidate_limit = limit
-                .checked_add(1)
-                .ok_or_else(|| McpError::invalid_params("limit is too large", None))?;
-            let hybrid = if semantic_only {
-                pipeline
-                    .search_abstract_semantic(
-                        &self.metadata_table.name(),
-                        query,
-                        model,
-                        offset,
-                        candidate_limit,
-                        self.embedding_ctx,
-                        embedder.as_ref(),
-                    )
-                    .await
-            } else {
-                pipeline
-                    .search_abstract(
-                        &self.table,
-                        &self.metadata_table.name(),
-                        query,
-                        model,
-                        offset,
-                        None,
-                        candidate_limit,
-                        self.embedding_ctx,
-                        embedder.as_ref(),
-                    )
-                    .await
-            }
-            .map_err(internal_error)?;
-            eprintln!(
-                "[embedded-search] {mode} pipeline complete elapsed_ms={} candidates={}",
-                hybrid_started.elapsed().as_millis(),
-                hybrid.hits.len()
-            );
-            let has_more = hybrid.hits.len() > limit;
-            let mut page = hybrid.hits.into_iter().take(limit + 1).collect::<Vec<_>>();
-            if semantic_only {
-                page.sort_by(|left, right| {
-                    left.cosine_distance
-                        .unwrap_or(f32::INFINITY)
-                        .total_cmp(&right.cosine_distance.unwrap_or(f32::INFINITY))
-                        .then(left.paper_id.cmp(&right.paper_id))
-                });
-            }
-            page.truncate(limit);
-            let paper_ids = page
-                .iter()
-                .map(|hit| hit.paper_id.clone())
-                .collect::<Vec<_>>();
-            let metadata = self.metadata_for_ids(&paper_ids).await?;
-            let hits = page
-                .into_iter()
-                .map(|hit| {
-                    let (snippet, snippet_truncated) =
-                        search_excerpt(&hit.text, query, SEARCH_SNIPPET_CHARS);
-                    SearchHit {
-                        metadata: metadata.get(&hit.paper_id).cloned(),
-                        paper_id: hit.paper_id,
-                        snippet,
-                        snippet_truncated,
-                        embedding_vector_f16_bits: hit.embedding_vector_f16_bits,
-                        cosine_distance: hit.cosine_distance,
-                    }
-                })
-                .collect::<Vec<_>>();
-            eprintln!(
-                "[embedded-search] result metadata complete returned={} has_more={has_more}",
-                hits.len()
-            );
-            (hits, has_more)
-        };
-        let result_count = results.len();
-        let next_offset = offset.saturating_add(result_count);
-        let response = SearchResponse {
-            search_url: format!(
-                "/?tool=search_embedded_papers&embedded_only=1&query={}&embedding_model={}&limit={limit}&offset={offset}",
-                Self::encode_query_parameter(query),
-                Self::encode_query_parameter(model),
-            ),
-            metadata: SearchMetadata {
+                let ids = dense_hits
+                    .iter()
+                    .map(|hit| hit.paper_id.clone())
+                    .collect::<Vec<_>>();
+                let metadata = self.metadata_for_ids(&ids).await?;
+                dense_hits
+                    .into_iter()
+                    .map(|hit| {
+                        let (snippet, snippet_truncated) =
+                            search_excerpt(&hit.text, query, SEARCH_SNIPPET_CHARS);
+                        SearchHit {
+                            metadata: metadata.get(&hit.paper_id).cloned(),
+                            paper_id: hit.paper_id,
+                            snippet,
+                            snippet_truncated,
+                            embedding_vector_f16_bits: hit.embedding_vector_f16_bits,
+                            cosine_distance: hit.cosine_distance,
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+
+            request_cache.result_set = Some(CachedSearchResultSet {
+                results,
+                search_url: format!(
+                    "/?tool=search_embedded_papers&embedded_only=1&query={}&embedding_model={}&limit={limit}",
+                    Self::encode_query_parameter(query),
+                    Self::encode_query_parameter(model),
+                ),
                 lookup_time_ms: started_at.elapsed().as_millis() as u64,
-                result_count,
-                offset,
-                next_offset,
-                has_more,
-            },
-            results,
-        };
-        eprintln!(
-            "[embedded-search] complete elapsed_ms={} result_count={} has_more={has_more}",
-            started_at.elapsed().as_millis(),
-            response.metadata.result_count
-        );
-        serde_json::to_string_pretty(&response).map_err(internal_error)
+            });
+            eprintln!(
+                "[embedded-search] pipeline complete elapsed_ms={} scope_results={}",
+                started_at.elapsed().as_millis(),
+                request_cache
+                    .result_set
+                    .as_ref()
+                    .map_or(0, |result_set| result_set.results.len())
+            );
+        } else {
+            eprintln!("[embedded-search] cache hit request_id={request_id}");
+        }
+        cached_search_page(&request_id, &mut request_cache, page, page_size)
     }
 
     #[tool(
@@ -3288,6 +3388,62 @@ async fn ensure_indexing_state_fields(table: &Table) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+fn search_request_id(
+    mode: &str,
+    query: &str,
+    model: &str,
+    scope: usize,
+) -> Result<String, McpError> {
+    let canonical = serde_json::to_vec(&(mode, query, model, scope)).map_err(internal_error)?;
+    Ok(blake3::hash(&canonical).to_hex().to_string())
+}
+
+fn cached_search_page(
+    request_id: &str,
+    cache: &mut SearchRequestCache,
+    page: usize,
+    page_size: usize,
+) -> Result<String, McpError> {
+    if let Some(cached) = cache.pages.get(&(page_size, page)) {
+        return Ok(cached.clone());
+    }
+    let result_set = cache
+        .result_set
+        .as_ref()
+        .ok_or_else(|| internal_error("search result cache is not populated"))?;
+    let offset = page
+        .checked_mul(page_size)
+        .ok_or_else(|| McpError::invalid_params("page is too large", None))?;
+    let total_results = result_set.results.len();
+    let results = result_set
+        .results
+        .iter()
+        .skip(offset)
+        .take(page_size)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_offset = offset.saturating_add(results.len());
+    let response = SearchResponse {
+        results,
+        metadata: SearchMetadata {
+            lookup_time_ms: result_set.lookup_time_ms,
+            result_count: next_offset.saturating_sub(offset),
+            offset,
+            next_offset,
+            has_more: next_offset < total_results,
+            total_results,
+        },
+        search_url: format!(
+            "{}&page_size={page_size}&page={page}",
+            result_set.search_url
+        ),
+        request_id: request_id.to_owned(),
+    };
+    let serialized = serde_json::to_string_pretty(&response).map_err(internal_error)?;
+    cache.pages.insert((page_size, page), serialized.clone());
+    Ok(serialized)
+}
+
 fn sql_string(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -3487,9 +3643,9 @@ mod tests {
     use super::{
         ABSTRACT_PERSIST_BATCH_SIZE, DEFAULT_EMBEDDING_CTX, IndexBuildProgress,
         IndexBuildProgressHub, IndexJobManager, MAX_LFM_EMBEDDING_TOKENS, SEARCH_SNIPPET_CHARS,
-        ensure_indexing_state_fields, model_from_vector_column, pending_index_filter,
-        search_excerpt, sql_string, take_abstract_persist_batch, update_paper_index_state,
-        validate_embedding_ctx,
+        cached_search_page, ensure_indexing_state_fields, model_from_vector_column,
+        pending_index_filter, search_excerpt, search_request_id, sql_string,
+        take_abstract_persist_batch, update_paper_index_state, validate_embedding_ctx,
     };
     use lancedb::{
         arrow::{
@@ -3498,7 +3654,62 @@ mod tests {
         },
         connect,
     };
-    use std::sync::Arc;
+    use std::{collections::HashMap, sync::Arc};
+
+    #[test]
+    fn search_request_id_is_stable_and_scope_specific() {
+        let original = search_request_id("semantic", "vector search", "model-a", 20).unwrap();
+        assert_eq!(
+            original,
+            search_request_id("semantic", "vector search", "model-a", 20).unwrap()
+        );
+        assert_ne!(
+            original,
+            search_request_id("semantic", "vector search", "model-a", 100).unwrap()
+        );
+        assert_ne!(
+            original,
+            search_request_id("hybrid", "vector search", "model-a", 20).unwrap()
+        );
+    }
+
+    #[test]
+    fn cached_search_pages_slice_results_without_rebuilding_the_search() {
+        let mut cache = super::SearchRequestCache {
+            mode: "semantic".to_owned(),
+            query: "query".to_owned(),
+            model: "model".to_owned(),
+            scope: 3,
+            result_set: Some(super::CachedSearchResultSet {
+                results: ["paper-1", "paper-2", "paper-3"]
+                    .into_iter()
+                    .map(|paper_id| super::SearchHit {
+                        paper_id: paper_id.to_owned(),
+                        metadata: None,
+                        snippet: String::new(),
+                        snippet_truncated: false,
+                        embedding_vector_f16_bits: None,
+                        cosine_distance: None,
+                    })
+                    .collect(),
+                search_url: "/?tool=search_embedded_papers".to_owned(),
+                lookup_time_ms: 10,
+            }),
+            pages: HashMap::new(),
+        };
+
+        let page = cached_search_page("request-id", &mut cache, 1, 2).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&page).unwrap();
+        assert_eq!(parsed["results"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["results"][0]["paper_id"], "paper-3");
+        assert_eq!(parsed["metadata"]["offset"], 2);
+        assert_eq!(parsed["metadata"]["total_results"], 3);
+        assert!(!parsed["metadata"]["has_more"].as_bool().unwrap());
+        assert_eq!(
+            cached_search_page("request-id", &mut cache, 1, 2).unwrap(),
+            page
+        );
+    }
 
     #[tokio::test]
     async fn index_build_progress_is_pushed_to_registered_subscribers() {

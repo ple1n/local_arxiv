@@ -27,9 +27,11 @@ type SearchHit = {
 type SearchResponse = {
   results: SearchHit[];
   search_url: string;
+  request_id: string;
   metadata: {
     lookup_time_ms: number;
     result_count: number;
+    total_results: number;
     offset: number;
     next_offset: number;
     has_more: boolean;
@@ -132,8 +134,17 @@ type ModelChoices = {
 };
 
 type EmbeddingMode = "full_text" | "abstract";
-type ResultsPerPage = 20 | 100 | 1000;
-const RESULTS_PER_PAGE_OPTIONS: ResultsPerPage[] = [20, 100, 1000];
+type SearchScope = 20 | 100 | 1000;
+const SEARCH_SCOPE_OPTIONS: SearchScope[] = [20, 100, 1000];
+type WirePageSize = 20 | 50 | 100;
+const WIRE_PAGE_SIZE_OPTIONS: WirePageSize[] = [20, 50, 100];
+type SearchMode = "lexical" | "semantic" | "hybrid";
+type ActiveSearch = {
+  query: string;
+  mode: SearchMode;
+  embeddingModel: string;
+  scope: SearchScope;
+};
 
 type QueryPipelineResponse = {
   embedding_model: string;
@@ -458,12 +469,17 @@ const paperCss = `
 function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   const initialParams = new URLSearchParams(window.location.search);
   const requestedPageSize = Number.parseInt(initialParams.get("limit") ?? "", 10);
-  const initialPageSize = RESULTS_PER_PAGE_OPTIONS.includes(requestedPageSize as ResultsPerPage)
-    ? requestedPageSize as ResultsPerPage
+  const requestedWirePageSize = Number.parseInt(initialParams.get("page_size") ?? "", 10);
+  const initialSearchScope = SEARCH_SCOPE_OPTIONS.includes(requestedPageSize as SearchScope)
+    ? requestedPageSize as SearchScope
+    : 20;
+  const initialWirePageSize = WIRE_PAGE_SIZE_OPTIONS.includes(requestedWirePageSize as WirePageSize)
+    ? requestedWirePageSize as WirePageSize
     : 20;
   const serverAddress = new URL(apiBaseUrl).host;
   const clientRef = useRef<Client | null>(null);
   const transportRef = useRef<StreamableHTTPClientTransport | null>(null);
+  const activeSearchRef = useRef<ActiveSearch | null>(null);
   const jobEventSourceRef = useRef<EventSource | null>(null);
   const indexJobSubscriptionRef = useRef<IndexJobSubscription | null>(null);
   const lastIndexProgressAtRef = useRef(0);
@@ -477,11 +493,14 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       ? initialParams.get("embedded_only") === "1"
       : initialParams.get("semantic") === "1",
   );
-  const [pageSize, setPageSize] = useState<ResultsPerPage>(initialPageSize);
+  const [searchScope, setSearchScope] = useState<SearchScope>(initialSearchScope);
+  const [wirePageSize, setWirePageSize] = useState<WirePageSize>(initialWirePageSize);
+  const [currentPage, setCurrentPage] = useState(0);
   const [searchUrl, setSearchUrl] = useState("");
   const [hits, setHits] = useState<SearchHit[]>([]);
+  const [totalResults, setTotalResults] = useState(0);
   const [lookupTimeMs, setLookupTimeMs] = useState<number | null>(null);
-  const [nextOffset, setNextOffset] = useState(0);
+  const [searchRequestId, setSearchRequestId] = useState<string | null>(null);
   const [hasMore, setHasMore] = useState(false);
   const [selected, setSelected] = useState<PaperText | null>(null);
   const [busy, setBusy] = useState(false);
@@ -604,10 +623,12 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             (tool === "search_embedded_papers" &&
               (initialParams.get("embedded_only") === "1" || initialParams.get("semantic") === "1"))) {
             await fetchSearchPage(
-              Number.parseInt(initialParams.get("offset") ?? "0", 10) || 0,
+              Number.parseInt(initialParams.get("page") ?? "0", 10) ||
+                Math.floor((Number.parseInt(initialParams.get("offset") ?? "0", 10) || 0) / initialWirePageSize),
+              searchScope,
               false,
-              pageSize,
-              false,
+              null,
+              initialWirePageSize,
             );
           } else if (tool === "get_paper_text" && initialParams.get("paper_id")) {
             await openPaper(
@@ -638,17 +659,22 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   }, [apiBaseUrl, serverAddress]);
 
   async function fetchSearchPage(
-    offset: number,
-    append: boolean,
-    limit = pageSize,
+    page: number,
+    scope = searchScope,
     updateUrl = true,
+    requestId?: string | null,
+    pageSize = wirePageSize,
   ) {
     const client = clientRef.current;
-    const searchQuery = query.trim();
-    const searchMode = lexicalSearch
+    const activeSearch = requestId ? activeSearchRef.current : null;
+    const searchQuery = activeSearch?.query ?? query.trim();
+    const searchMode: SearchMode | null = activeSearch?.mode ?? (lexicalSearch
       ? semanticSearch ? "hybrid" : "lexical"
-      : semanticSearch ? "semantic" : null;
-    if (!client || !searchMode || (!searchQuery && !semanticSearch)) return;
+      : semanticSearch ? "semantic" : null);
+    const requestScope = activeSearch?.scope ?? scope;
+    const requestEmbeddingModel = activeSearch?.embeddingModel ?? selectedEmbeddingModel;
+    const allowsEmptyQuery = activeSearch ? activeSearch.mode !== "lexical" : semanticSearch;
+    if (!client || !searchMode || (!searchQuery && !allowsEmptyQuery)) return;
 
     setBusy(true);
     setError("");
@@ -659,20 +685,36 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
         arguments: searchMode !== "lexical"
           ? {
               query: searchQuery,
-              ...(selectedEmbeddingModel ? { embedding_model: selectedEmbeddingModel } : {}),
+              ...(requestEmbeddingModel ? { embedding_model: requestEmbeddingModel } : {}),
               ...(searchMode === "semantic" ? { semantic_only: true } : {}),
-              limit,
-              offset,
+              limit: requestScope,
+              page_size: pageSize,
+              page,
+              ...(requestId ? { request_id: requestId } : {}),
             }
-          : { query: searchQuery, limit, offset },
+          : {
+              query: searchQuery,
+              limit: requestScope,
+              page_size: pageSize,
+              page,
+              ...(requestId ? { request_id: requestId } : {}),
+            },
       }, undefined, { timeout: 180_000 });
       const searchResponse = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
       ) as SearchResponse;
       const resultHits = searchResponse.results;
-      setHits((current) => append ? [...current, ...resultHits] : resultHits);
+      setHits(resultHits);
+      setCurrentPage(page);
       setLookupTimeMs(searchResponse.metadata.lookup_time_ms);
-      setNextOffset(searchResponse.metadata.next_offset);
+      setSearchRequestId(searchResponse.request_id);
+      activeSearchRef.current = {
+        query: searchQuery,
+        mode: searchMode,
+        embeddingModel: requestEmbeddingModel,
+        scope: requestScope,
+      };
+      setTotalResults(searchResponse.metadata.total_results);
       setHasMore(searchResponse.metadata.has_more);
       const shareUrl = new URL(searchResponse.search_url, window.location.origin);
       shareUrl.searchParams.set("lexical", lexicalSearch ? "1" : "0");
@@ -683,11 +725,13 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       }
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
-      if (!append) {
+      if (!requestId) {
         setHits([]);
         setLookupTimeMs(null);
-        setNextOffset(0);
+        setTotalResults(0);
         setHasMore(false);
+        setSearchRequestId(null);
+        activeSearchRef.current = null;
       }
     } finally {
       setBusy(false);
@@ -752,11 +796,18 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
   async function search(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSelected(null);
-    await fetchSearchPage(0, false);
+    await fetchSearchPage(0, searchScope, true, null, wirePageSize);
   }
 
-  async function loadMore() {
-    await fetchSearchPage(nextOffset, true);
+  async function navigateSearchPage(page: number) {
+    if (!searchRequestId || page < 0) return;
+    await fetchSearchPage(
+      page,
+      activeSearchRef.current?.scope ?? searchScope,
+      true,
+      searchRequestId,
+      wirePageSize,
+    );
   }
 
   async function openPaper(paperId: string, maxChars = 1_000_000, updateUrl = true) {
@@ -1146,18 +1197,18 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
         </form>
         <div className="search-note">
           <span>Local index · Search results include matching text and metadata</span>
-          <div className="page-size-control" role="group" aria-label="Results per page">
-            <span>Results per page</span>
-            {RESULTS_PER_PAGE_OPTIONS.map((size) => (
+          <div className="page-size-control" role="group" aria-label="Search scope">
+            <span>Search scope</span>
+            {SEARCH_SCOPE_OPTIONS.map((size) => (
               <button
                 key={size}
                 type="button"
                 className="page-size-button"
-                aria-pressed={pageSize === size}
+                aria-pressed={searchScope === size}
                 disabled={busy}
                 onClick={() => {
-                  setPageSize(size);
-                  void fetchSearchPage(0, false, size);
+                  setSearchScope(size);
+                  void fetchSearchPage(0, size, true, null, wirePageSize);
                 }}
               >
                 {size}
@@ -1281,7 +1332,7 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
         {hits.length > 0 && (
           <div className="results-heading">
             <div className="results-summary">
-              <h2>{hits.length} matching papers</h2>
+              <h2>{totalResults} matching papers in scope</h2>
               {lookupTimeMs !== null && <span className="lookup-time">{lookupTimeMs} ms</span>}
             </div>
             <div className="results-actions">
@@ -1290,12 +1341,57 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             </div>
           </div>
         )}
+        {hits.length > 0 && (
+          <div className="result-pagination">
+            <div className="page-size-control" role="group" aria-label="Page size sent to server">
+              <span>Page size</span>
+              {WIRE_PAGE_SIZE_OPTIONS.map((size) => (
+                <button
+                  key={size}
+                  type="button"
+                  className="page-size-button"
+                  aria-pressed={wirePageSize === size}
+                  disabled={busy}
+                  onClick={() => {
+                    setWirePageSize(size);
+                    if (searchRequestId) {
+                      void fetchSearchPage(0, searchScope, true, searchRequestId, size);
+                    }
+                  }}
+                >
+                  {size}
+                </button>
+              ))}
+            </div>
+            <div className="page-navigation">
+              <button
+                type="button"
+                className="page-size-button"
+                disabled={busy || currentPage === 0}
+                onClick={() => void navigateSearchPage(currentPage - 1)}
+              >
+                Previous
+              </button>
+              <span>
+                Page {currentPage + 1} of {Math.max(1, Math.ceil(totalResults / wirePageSize))}
+              </span>
+              <button
+                type="button"
+                className="page-size-button"
+                disabled={busy || !hasMore}
+                onClick={() => void navigateSearchPage(currentPage + 1)}
+              >
+                Next
+              </button>
+            </div>
+          </div>
+        )}
         <div className="results-grid">
           <div className="result-list">
             {hits.map((hit, index) => (
               <article className="paper-card" key={hit.paper_id}>
                 <div className="card-topline">
-                  <span className="result-number">{index + 1}.</span>
+                  <span className="result-number">{currentPage * wirePageSize + index + 1}.</span>
                   <button className="paper-id" onClick={() => void openPaper(hit.paper_id)}>{hit.paper_id} ↗</button>
                 </div>
                 <button className="paper-title" onClick={() => void openPaper(hit.paper_id)}>
@@ -1338,11 +1434,6 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
                 </div>
               </article>
             ))}
-            {hasMore && (
-              <button className="load-more" onClick={() => void loadMore()} disabled={busy}>
-                {busy ? "Loading…" : "Load more"}
-              </button>
-            )}
             {!hits.length && !busy && !error && (
               <div className="empty-state">
                 <div className="empty-symbol">⌘</div>

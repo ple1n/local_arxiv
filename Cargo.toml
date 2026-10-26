@@ -5,6 +5,7 @@ edition = "2024"
 default-run = "lance_arxiv"
 
 [dependencies]
+blake3 = "1"
 lancedb = { version = "0.40.0", features = ["remote"] }
 parquet2 = "0.17.2"
 parquet = { version = "58.4.0", features = ["arrow"] }

@@ -68,15 +68,21 @@ The database path and table names remain backend environment settings:
 
 ## Tools
 
-- `search_full_text(query, limit?, offset?)`: full-text search, returning paper IDs and
+- `search_full_text(query, limit?, page_size?, page?, request_id?)`: full-text search, returning paper IDs and
   short snippets plus available title/author/category/DOI metadata.
-  `limit` supports up to 1000 results per page. The response includes `results` and `metadata`
-  (`lookup_time_ms`, `result_count`, `offset`, `next_offset`, and `has_more`).
-  It also includes `search_url`, a page URL that reproduces the request.
-  Use `offset` with `limit` to paginate through matching results. The page
-  accepts `tool=search_full_text&query=...&limit=...&offset=...` and
+  `limit` is the search scope (up to 1000 candidates). `page_size` controls
+  how many cached results are sent per response, and `page` selects the
+  zero-based result page. The response includes `results` and `metadata`
+  (`lookup_time_ms`, `result_count`, `total_results`, `offset`, `next_offset`,
+  and `has_more`). It also includes `search_url`, a page URL that reproduces
+  the request. The page
+  accepts `tool=search_full_text&query=...&limit=...&page_size=...&page=...` and
   `tool=get_paper_text&paper_id=...&max_chars=...` URL parameters to replay
-  those MCP requests.
+  those MCP requests. Responses include a deterministic BLAKE3 `request_id`
+  keyed by query, mode, model, and search scope. The server caches the full
+  scoped result set for 30 minutes and slices it for each `request_id`, `page`,
+  and `page_size`; changing page size or page does not rerun the database
+  search. Changing scope creates a new search request and result set.
 - `get_paper_text(paper_id, max_chars?)`: return stored paper text, capped at
   12,000 characters per call by default and at most, along with available
   metadata.
@@ -112,8 +118,13 @@ The database path and table names remain backend environment settings:
   optionally be reranked. In paginated embedded-paper search, the offset is
   applied to each underlying lexical/vector query before their results are
   fused.
-- `search_embedded_papers(query, embedding_model?, limit?, offset?,
-  semantic_only?)`: semantic-only results are page-local sorted by exact cosine
+- `search_embedded_papers(query, embedding_model?, limit?, page_size?, page?,
+  semantic_only?, request_id?)`: `limit` is the database search scope (the UI
+  offers 20, 100, and 1000); changing scope starts a separate request rather
+  than extending or merging the previous result set. `page_size` controls only
+  the number of cached hits sent over the wire (the UI offers 20, 50, and 100).
+  Follow-up pages pass the deterministic BLAKE3 `request_id` and select a page
+  from that request's cached result set. Semantic-only results are sorted by exact cosine
   distance computed from each returned stored f16 vector and the query vector.
   Each semantic hit includes its f16 vector bit patterns and cosine distance;
   this exact distance is distinct from IVF-PQ's approximate candidate ranking.
