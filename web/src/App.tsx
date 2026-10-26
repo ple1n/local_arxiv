@@ -73,6 +73,7 @@ type ChunkApiResponse = Omit<ChunkResponse, "chunks"> & {
 
 type IndexJobProgress = {
   job_id: string;
+  embedding_model: string;
   state: "queued" | "running" | "paused" | "complete" | "complete_with_errors" | "failed";
   total_papers: number;
   total_papers_known: boolean;
@@ -94,6 +95,7 @@ type StartIndexJobResponse = {
   job_id: string;
   events_url: string;
   state: string;
+  embedding_model: string;
 };
 
 type AbstractEmbeddingIndexStatus = {
@@ -538,15 +540,17 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
             const activeJob = await activeJobResponse.json() as IndexJobProgress | null;
             if (active && activeJob) {
               setIndexJobProgress(activeJob);
+              setSelectedEmbeddingModel(activeJob.embedding_model);
               setEmbeddingBusy(activeJob.state === "running" || activeJob.state === "queued");
               connectIndexingProgress({
                 job: {
                   job_id: activeJob.job_id,
                   events_url: `/indexing-jobs/${activeJob.job_id}/events`,
                   state: activeJob.state,
+                  embedding_model: activeJob.embedding_model,
                 },
                 mode: embeddingMode,
-                model: selectedEmbeddingModel,
+                model: activeJob.embedding_model,
               });
                 setEmbeddingBusy(activeJob.state === "running" || activeJob.state === "queued");
             }
@@ -557,10 +561,11 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
               getText(modelsResult as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
             ) as ModelChoices;
             setModelChoices(choices);
+            setModelChoicesError("");
             setSelectedEmbeddingModel((current) =>
               choices.embedding.some((model) => model.id === current)
                 ? current
-                : choices.embedding.find((model) => model.id === "Qwen3-Embedding-8B-Q4_KM-32K")?.id
+                : choices.embedding.find((model) => model.tags.includes("python-server"))?.id
                   ?? choices.embedding[0]?.id
                   ?? "",
             );
@@ -832,8 +837,8 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
       const response = await client.callTool({
         name: "start_indexing_job",
         arguments: paperId
-          ? { paper_id: paperId, token_budget: tokenBudget, mode: embeddingMode }
-          : { mode: embeddingMode },
+          ? { paper_id: paperId, token_budget: tokenBudget, mode: embeddingMode, embedding_model: selectedEmbeddingModel }
+          : { mode: embeddingMode, embedding_model: selectedEmbeddingModel },
       });
       const job = JSON.parse(
         getText(response as { content: Array<{ type: string; text?: string }>; isError?: boolean }),
@@ -1155,6 +1160,21 @@ function App({ apiBaseUrl }: { apiBaseUrl: string }) {
               onChange={(event) => setRenderLatex(event.target.checked)}
             />
             Render LaTeX
+          </label>
+          <label className="model-select-label">
+            Embedding model
+            <select
+              value={selectedEmbeddingModel}
+              onChange={(event) => setSelectedEmbeddingModel(event.target.value)}
+              disabled={!modelChoices.embedding.length || embeddingBusy || queryPipelineBusy}
+            >
+              {!modelChoices.embedding.length && <option value="">No embedding models available</option>}
+              {modelChoices.embedding.map((model) => (
+                <option key={model.id} value={model.id}>
+                  {model.id} ({model.tags.includes("python-server") ? "Python" : "llama-server"})
+                </option>
+              ))}
+            </select>
           </label>
           <button
             className="chunk-button"

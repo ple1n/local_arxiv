@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import logging
 import math
 import os
 import random
@@ -16,22 +17,23 @@ from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock, Thread
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 MODEL_ID = os.getenv(
     "EMBEDDING_MODEL",
-    "google/embeddinggemma-2",
+    "google/embeddinggemma-300m",
 )
+logger = logging.getLogger("embedding_server")
 MAX_BODY_BYTES = 1_048_576
 MAX_TEXTS = 32
 EMBEDDING_DIMENSION = 128
-MAX_SEQUENCE_LENGTH = 8192
+MAX_SEQUENCE_LENGTH = 2048
 
 model: Any = None
-encode_lock = Lock()
+model_load_lock = Lock()
 gpu_lock = Lock()
 index_jobs_lock = Lock()
 index_jobs: dict[str, dict[str, Any]] = {}
@@ -41,6 +43,21 @@ _readiness_scope: tuple[str, str] | None = None
 _lance_readiness_scope_installed = False
 _readiness_row_counts: tuple[int, int] | None = None
 _original_lance_to_tensor: Any = None
+
+
+def _start_operation_heartbeat(operation: str, started_at: float) -> Event:
+    stopped = Event()
+
+    def report() -> None:
+        while not stopped.wait(15):
+            logger.info(
+                "%s still in progress (%.0f seconds elapsed)",
+                operation,
+                time.monotonic() - started_at,
+            )
+
+    Thread(target=report, name="embedding-heartbeat", daemon=True).start()
+    return stopped
 
 
 def _is_loopback_request(handler: BaseHTTPRequestHandler) -> bool:
@@ -360,6 +377,7 @@ def _run_index_job(
         stage, completed, total = _progress_fields(progress)
         with index_jobs_lock:
             job = index_jobs[job_id]
+            previous_stage = job.get("stage")
             job.update(
                 {
                     "stage": stage,
@@ -368,12 +386,21 @@ def _run_index_job(
                 }
             )
             snapshot = dict(job)
+        if stage != previous_stage:
+            logger.info("Index job %s: %s", job_id, stage)
         try:
             _push_index_progress(callback_url, snapshot)
         except Exception as exc:
             print(f"Could not push IVF-PQ progress for job {job_id}: {exc}", flush=True)
 
     try:
+        logger.info(
+            "Index job %s opening table=%r column=%r database=%s",
+            job_id,
+            table_name,
+            column_name,
+            database_path,
+        )
         import lancedb
         import torch
         from lance.torch import data as lance_torch_data
@@ -388,6 +415,7 @@ def _run_index_job(
         lance_torch_data._to_tensor = _writable_lance_to_tensor
         database = lancedb.connect(database_path)
         table = database.open_table(table_name)
+        logger.info("Index job %s opened table; counting vectors", job_id)
         vector_type = table.schema.field(column_name).type
         dimension = getattr(vector_type, "list_size", None)
         if not isinstance(dimension, int):
@@ -410,6 +438,14 @@ def _run_index_job(
         )
         num_sub_vectors = _suggest_num_sub_vectors(dimension)
         num_partitions = _suggest_num_partitions(vector_count)
+        logger.info(
+            "Index job %s has %d vectors of dimension %d; partitions=%d, subvectors=%d",
+            job_id,
+            vector_count,
+            dimension,
+            num_partitions,
+            num_sub_vectors,
+        )
         dataset = table.to_lance()
         with index_jobs_lock:
             index_jobs[job_id]["state"] = "running"
@@ -493,6 +529,8 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def do_POST(self) -> None:
+        started_at = time.monotonic()
+        logger.info("Received %s request from %s", self.path, self.client_address[0])
         if self.path not in {"/embed", "/embed/query", "/embed/document", "/index-jobs"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
@@ -524,6 +562,14 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
             self._start_index_job(payload)
             return
 
+        requested_model = payload.get("model") if isinstance(payload, dict) else None
+        if not isinstance(requested_model, str) or requested_model != MODEL_ID:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": f"model must match the configured model {MODEL_ID!r}"},
+            )
+            return
+
         texts = payload.get("texts") if isinstance(payload, dict) else None
         if (
             not isinstance(texts, list)
@@ -537,16 +583,42 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
             return
 
         try:
-            with encode_lock, gpu_lock:
-                global model
+            operation_started_at = time.monotonic()
+            heartbeat = _start_operation_heartbeat(
+                f"Embedding request {self.path}", operation_started_at
+            )
+            global model
+            with model_load_lock:
                 if model is None:
-                    from sentence_transformers import SentenceTransformer
+                    load_started_at = time.monotonic()
+                    logger.info("Loading embedding model %s", MODEL_ID)
+                    load_heartbeat = _start_operation_heartbeat(
+                        f"Loading embedding model {MODEL_ID}", load_started_at
+                    )
+                    try:
+                        from sentence_transformers import SentenceTransformer
 
-                    model = SentenceTransformer(MODEL_ID, trust_remote_code=True)
+                        model = SentenceTransformer(MODEL_ID, trust_remote_code=True)
+                    finally:
+                        load_heartbeat.set()
                     model.max_seq_length = MAX_SEQUENCE_LENGTH
-                prompt_name = (
-                    "SearchQuery" if self.path == "/embed/query" else "Document"
-                )
+                    logger.info(
+                        "Loaded embedding model %s in %.1f seconds",
+                        MODEL_ID,
+                        time.monotonic() - load_started_at,
+                    )
+            prompt_name = "query" if self.path == "/embed/query" else "document"
+            encode_started_at = time.monotonic()
+            logger.info(
+                "Encoding %d text(s) via %s (model=%s)",
+                len(texts),
+                self.path,
+                MODEL_ID,
+            )
+            encode_heartbeat = _start_operation_heartbeat(
+                f"Encoding {len(texts)} text(s)", encode_started_at
+            )
+            try:
                 vectors = model.encode(
                     texts,
                     prompt_name=prompt_name,
@@ -555,8 +627,18 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                     show_progress_bar=False,
                     truncate_dim=EMBEDDING_DIMENSION,
                 )
+            finally:
+                encode_heartbeat.set()
+            heartbeat.set()
+            logger.info(
+                "Encoded %d text(s) into %d-dimensional vectors in %.1f seconds",
+                len(texts),
+                int(vectors.shape[1]),
+                time.monotonic() - started_at,
+            )
         except Exception as exc:
-            self.log_error("Embedding inference failed: %s", exc)
+            heartbeat.set()
+            logger.exception("Embedding inference failed after %.1f seconds", time.monotonic() - started_at)
             self._send_json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "Embedding inference failed"})
             return
 
@@ -679,6 +761,11 @@ def load_listener_config(config_path: Path) -> tuple[str, int]:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=os.getenv("LOG_LEVEL", "INFO").upper(),
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     parser = argparse.ArgumentParser(description="Serve local Sentence Transformers embeddings.")
     parser.add_argument(
         "--config",
@@ -690,7 +777,7 @@ def main() -> None:
 
     address, port = load_listener_config(args.config)
     server = ThreadingHTTPServer((address, port), EmbeddingHandler)
-    print(f"Serving the Python embedding/index service on http://{address}:{port}", flush=True)
+    logger.info("Serving the Python embedding/index service on http://%s:%d", address, port)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

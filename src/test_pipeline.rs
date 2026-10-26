@@ -118,7 +118,13 @@ impl Embedder for HttpEmbedder {
                 .iter()
                 .map(|text| prepare_embedding_input(&self.tokenizer, text, task, max_tokens))
                 .collect::<PipelineResult<Vec<_>>>()?;
-            let _permit = self.scheduler.acquire().await?;
+            let permit_count = u32::try_from(texts.len())
+                .map_err(|_| "embedding batch is too large for the concurrency gate")?;
+            let _permit = self
+                .scheduler
+                .clone()
+                .acquire_many_owned(permit_count)
+                .await?;
             let mut request = self.client.post(&self.endpoint).json(&serde_json::json!({
                 "model": self.model,
                 "input": inputs,

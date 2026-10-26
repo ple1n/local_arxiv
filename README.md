@@ -44,6 +44,12 @@ Runtime settings are read from the root [`config.json`](./config.json):
 - `frontend.host` and `frontend.port`: Vite dev-server listen address
 - `embedding.host` and `embedding.port`: optional Python embedding-service
   listen address
+- `embedding.maxConcurrentTexts`: shared Rust semaphore capacity measured in
+  texts, not batches or requests. A batch reserves permits for all its texts
+  before dispatch and releases them when its embedding request completes
+  (default: `32`, minimum: `32`)
+- `pythonEmbeddingModel`: exact model ID for the Python provider; it must match
+  the Python service's `EMBEDDING_MODEL`
 - `llama.host` and `llama.port`: existing llama-server API address, used for
   LFM embeddings and Qwen reranking
 - `models.embedding`: configured LFM model ID, user-managed GGUF path,
@@ -108,8 +114,8 @@ The database path and table names remain backend environment settings:
   chunks in the selected model's vector column.
 - `finalize_chunk_embeddings(chunk_table, model)`: create the model-specific
   cosine vector index after embedding batches finish.
-- `embed_texts(texts)`: embed 1 to 8 document passages with the configured LFM
-  model through llama-server and return the model and vector dimensions.
+- `embed_texts(texts)`: embed 1 to 8 document passages with the configured
+  Python model and return the model and vector dimensions.
 - `dataset_status()`: report the configured table and its row count.
 
 The paper reader's **Chunk paper** action previews chunk boundaries.
@@ -233,21 +239,24 @@ Python worker can open the existing Lance dataset and push build progress and
 completion events to the Rust backend. The Rust backend does not poll the worker:
 
 ```sh
-uv run --extra indexer python embedding_server.py
+uv run --extra indexer --extra embedding python embedding_server.py
 ```
 
 The worker requires CUDA and fails rather than silently building the index on
 the CPU. It derives the required PQ subvector count from the vector dimension.
 Optional `/embed`, `/embed/query`, and `/embed/document` endpoints use
 Sentence Transformers and accept batches of 1 to 32 strings in `texts`.
-`/embed/query` uses the `SearchQuery` prompt; `/embed/document` uses the
-`Document` prompt, and `/embed` remains an alias for document encoding. The
+`/embed/query` uses the `query` prompt; `/embed/document` uses the
+`document` prompt, and `/embed` remains an alias for document encoding. The
 default model is `google/embeddinggemma-2` (override with `EMBEDDING_MODEL`),
 with an 8K-token maximum sequence length. The `embedding` extra is needed only
 when an embedding endpoint is used. Embeddings are truncated to 128 dimensions
 by default; the model is loaded lazily so index-only runs do not reserve GPU
-memory for it. The Rust
-embedding and reranking pipeline remain unchanged. The chunk-test `ctx`
+memory for it. The web Embed model selector dispatches the selected model
+through its provider: Python embeddings use the Python service, while the
+configured LFM model and reranking continue to use llama-server. Rust sends the
+configured `pythonEmbeddingModel` explicitly and the Python server rejects a
+mismatched model rather than silently using its default. The chunk-test `ctx`
 argument defaults to 32K, but local LFM tokenization caps each input at the
 configured model maximum. `list_models` exposes the configured LFM embedding
 model and discovers reranking models from llama-server; set `MODEL_LIST_URL`

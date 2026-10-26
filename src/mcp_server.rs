@@ -1,3 +1,4 @@
+use crate::python_embedding::PythonEmbeddingClient;
 use crate::python_indexer::{IndexBuildProgress, PythonIndexClient};
 use crate::test_pipeline::Embedder;
 use axum::{
@@ -53,9 +54,8 @@ const DEFAULT_TABLE_NAME: &str = "arxiv_full_text";
 const MAX_SEARCH_RESULTS: usize = 10;
 const SEARCH_SNIPPET_CHARS: usize = 600;
 const MAX_PAPER_CHARS: usize = 1_000_000;
-const DEFAULT_EMBEDDING_CTX: usize = 32_768;
+const DEFAULT_EMBEDDING_CTX: usize = 2048;
 const MAX_LFM_EMBEDDING_TOKENS: usize = 512;
-const EMBEDDING_CONCURRENCY: usize = 4;
 const DEFAULT_CHUNK_TOKEN_BUDGET: usize =
     MAX_LFM_EMBEDDING_TOKENS - crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM;
 
@@ -64,6 +64,7 @@ static NEXT_INDEX_JOB_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Debug, Serialize)]
 struct IndexJobProgress {
     job_id: String,
+    embedding_model: String,
     state: String,
     total_papers: usize,
     total_papers_known: bool,
@@ -107,6 +108,16 @@ impl IndexJobManager {
     }
 
     async fn start(&self, paper_id: Option<String>, total_papers: usize) -> Result<String, String> {
+        self.start_for_model(paper_id, String::new(), total_papers)
+            .await
+    }
+
+    async fn start_for_model(
+        &self,
+        paper_id: Option<String>,
+        embedding_model: String,
+        total_papers: usize,
+    ) -> Result<String, String> {
         if self
             .active
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -124,6 +135,7 @@ impl IndexJobManager {
         );
         let initial = IndexJobProgress {
             job_id: job_id.clone(),
+            embedding_model,
             state: "queued".to_owned(),
             total_papers,
             total_papers_known: total_papers > 0,
@@ -332,12 +344,13 @@ impl IndexBuildProgressHub {
     }
 }
 
-struct JobPausableEmbedder<'a> {
-    inner: &'a dyn Embedder,
-    jobs: Option<&'a IndexJobManager>,
+#[derive(Clone)]
+struct JobPausableEmbedder {
+    inner: Arc<dyn Embedder>,
+    jobs: Option<IndexJobManager>,
 }
 
-impl Embedder for JobPausableEmbedder<'_> {
+impl Embedder for JobPausableEmbedder {
     fn model_name(&self) -> &str {
         self.inner.model_name()
     }
@@ -349,11 +362,11 @@ impl Embedder for JobPausableEmbedder<'_> {
         ctx: usize,
     ) -> crate::test_pipeline::ModelFuture<'a, Vec<Vec<f32>>> {
         Box::pin(async move {
-            if let Some(jobs) = self.jobs {
+            if let Some(jobs) = &self.jobs {
                 jobs.wait_until_resumed().await;
             }
             let vectors = self.inner.embed(texts, task, ctx).await?;
-            if let Some(jobs) = self.jobs {
+            if let Some(jobs) = &self.jobs {
                 jobs.record_embedding_completion(texts.len()).await;
             }
             Ok(vectors)
@@ -366,8 +379,10 @@ impl Embedder for JobPausableEmbedder<'_> {
 struct AppConfig {
     backend: ListenerConfig,
     frontend: ListenerConfig,
-    embedding: ListenerConfig,
+    embedding: EmbeddingServiceConfig,
     llama: ListenerConfig,
+    #[serde(rename = "pythonEmbeddingModel")]
+    python_embedding_model: String,
     #[serde(skip_serializing)]
     models: ModelsConfig,
     #[serde(rename = "apiBaseUrl")]
@@ -395,6 +410,14 @@ struct EmbeddingModelConfig {
 struct ListenerConfig {
     host: IpAddr,
     port: u16,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EmbeddingServiceConfig {
+    host: IpAddr,
+    port: u16,
+    max_concurrent_texts: usize,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -501,12 +524,8 @@ struct TestPaperArgs {
 struct EmbedTextsArgs {
     #[schemars(description = "Non-empty text passages to embed; provide 1 to 8 passages")]
     texts: Vec<String>,
-    #[schemars(description = "Optional embedding model ID from list_models")]
+    #[schemars(description = "Optional model ID for the Python embedding server")]
     model: Option<String>,
-    #[schemars(
-        description = "Embedding context; defaults to 32768 and applies a 32-token safety margin below the configured model limit"
-    )]
-    ctx: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -545,6 +564,10 @@ struct StartIndexJobArgs {
     token_budget: Option<usize>,
     #[schemars(description = "Embedding mode: abstract (default) or full_text")]
     mode: Option<String>,
+    #[schemars(
+        description = "Embedding model ID from list_models; defaults to the Python embedding model"
+    )]
+    embedding_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -634,6 +657,8 @@ struct ArxivMcpServer {
     database_path: String,
     embedding_model: String,
     embedding_endpoint: String,
+    python_embedding_model: String,
+    python_embedding_client: PythonEmbeddingClient,
     python_indexer: PythonIndexClient,
     model_list_endpoint: String,
     reranker_endpoint: String,
@@ -657,6 +682,8 @@ impl ArxivMcpServer {
         database_path: String,
         embedding: EmbeddingModelConfig,
         embedding_endpoint: String,
+        python_embedding_model: String,
+        python_embedding_endpoint: String,
         python_indexer_endpoint: String,
         python_indexer_callback_endpoint: String,
         model_list_endpoint: String,
@@ -675,6 +702,12 @@ impl ArxivMcpServer {
             database_path,
             embedding_model: embedding.id,
             embedding_endpoint,
+            python_embedding_model: python_embedding_model.clone(),
+            python_embedding_client: PythonEmbeddingClient::new(
+                python_embedding_endpoint,
+                python_embedding_model.clone(),
+                embedding_scheduler.clone(),
+            ),
             python_indexer: PythonIndexClient::new(
                 python_indexer_endpoint,
                 python_indexer_callback_endpoint,
@@ -691,15 +724,25 @@ impl ArxivMcpServer {
         }
     }
 
-    fn embedder(&self, model: &str) -> Result<crate::test_pipeline::HttpEmbedder, McpError> {
-        crate::test_pipeline::HttpEmbedder::new(
+    fn embedder(&self, model: &str) -> Result<Box<dyn Embedder>, McpError> {
+        if model == self.python_embedding_model {
+            return Ok(Box::new(self.python_embedding_client.clone()));
+        }
+        if model != self.embedding_model {
+            return Err(McpError::invalid_params(
+                "embedding model is not configured",
+                None,
+            ));
+        }
+        let embedder = crate::test_pipeline::HttpEmbedder::new(
             model,
             &self.embedding_endpoint,
             self.embedding_tokenizer.clone(),
             self.embedding_max_tokens,
             self.embedding_scheduler.clone(),
         )
-        .map_err(internal_error)
+        .map_err(internal_error)?;
+        Ok(Box::new(embedder))
     }
 
     async fn open_fresh_metadata_table(&self) -> Result<Table, Box<dyn Error + Send + Sync>> {
@@ -940,6 +983,7 @@ impl ArxivMcpServer {
         paper_id: Option<String>,
         token_budget: usize,
         mode: &str,
+        embedding_model: &str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         self.index_jobs
             .update(|progress| {
@@ -948,12 +992,14 @@ impl ArxivMcpServer {
             .await;
         let database = connect(&self.database_path).execute().await?;
         if mode == "abstract" {
-            return self.run_abstract_index_job(&database, paper_id).await;
+            return self
+                .run_abstract_index_job(&database, paper_id, embedding_model)
+                .await;
         }
         let filter = if let Some(paper_id) = &paper_id {
             format!("paper_id = {}", sql_string(paper_id))
         } else {
-            pending_index_filter(&self.embedding_model)
+            pending_index_filter(embedding_model)
         };
         self.index_jobs
             .update(|progress| {
@@ -1023,6 +1069,7 @@ impl ArxivMcpServer {
                         chunked,
                         embedded,
                         indexed_model.as_deref(),
+                        embedding_model,
                         self.embedding_ctx,
                         token_budget,
                         true,
@@ -1094,7 +1141,7 @@ impl ArxivMcpServer {
             self.index_jobs.wait_until_resumed().await;
             self.ensure_gpu_vector_index(
                 crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE,
-                &self.embedding_model,
+                embedding_model,
             )
             .await?;
         }
@@ -1105,6 +1152,7 @@ impl ArxivMcpServer {
         &self,
         _database: &lancedb::Connection,
         paper_id: Option<String>,
+        embedding_model: &str,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let table = &self.metadata_table;
         self.index_jobs
@@ -1114,8 +1162,7 @@ impl ArxivMcpServer {
                 progress.phase_total = None;
             })
             .await;
-        let ready_column =
-            crate::hybrid_pipeline::embedding_ready_column_name(&self.embedding_model);
+        let ready_column = crate::hybrid_pipeline::embedding_ready_column_name(embedding_model);
         let has_ready_column = table.schema().await?.field_with_name(&ready_column).is_ok();
         let mut filters = Vec::new();
         if let Some(id) = &paper_id {
@@ -1140,10 +1187,10 @@ impl ArxivMcpServer {
             .select(Select::columns(&["paper_id", "abstract"]))
             .execute()
             .await?;
-        let embedder = self.embedder(&self.embedding_model)?;
+        let embedder: Arc<dyn Embedder> = Arc::from(self.embedder(embedding_model)?);
         let job_embedder = JobPausableEmbedder {
-            inner: &embedder,
-            jobs: Some(&self.index_jobs),
+            inner: embedder,
+            jobs: Some(self.index_jobs.clone()),
         };
         let mut scanned = 0;
         let mut embedded_count = 0;
@@ -1166,44 +1213,32 @@ impl ArxivMcpServer {
             self.index_jobs
                 .update(|progress| progress.phase = Some("embedding abstracts".to_owned()))
                 .await;
-            let mut embedded_groups = stream::iter(groups)
-                .map(|group| {
-                    let embedding_model = self.embedding_model.as_str();
-                    let embedding_ctx = self.embedding_ctx;
-                    let job_embedder = &job_embedder;
-                    async move {
-                        let vectors = crate::hybrid_pipeline::embed_abstract_vectors(
-                            &group,
-                            embedding_model,
-                            embedding_ctx,
-                            job_embedder,
-                        )
-                        .await;
-                        (group, vectors)
-                    }
-                })
-                .buffer_unordered(EMBEDDING_CONCURRENCY);
-            while let Some((group, vector_result)) = embedded_groups.next().await {
+            let mut embedding_tasks = tokio::task::JoinSet::new();
+            for group in groups {
+                let embedding_model = embedding_model.to_owned();
+                let embedding_ctx = self.embedding_ctx;
+                let job_embedder = job_embedder.clone();
+                embedding_tasks.spawn(async move {
+                    let vectors = crate::hybrid_pipeline::embed_abstract_vectors(
+                        &group,
+                        &embedding_model,
+                        embedding_ctx,
+                        &job_embedder,
+                    )
+                    .await;
+                    (group, vectors)
+                });
+            }
+            let mut batch_papers = Vec::new();
+            let mut batch_vectors = Vec::new();
+            while let Some(joined) = embedding_tasks.join_next().await {
+                let (group, vector_result) = joined?;
+                let group_len = group.len();
                 let current = group.last().map(|(id, _)| id.clone());
                 match vector_result {
                     Ok(vectors) => {
-                        match crate::hybrid_pipeline::write_abstract_vectors(
-                            table,
-                            &group,
-                            vectors,
-                            &self.embedding_model,
-                        )
-                        .await
-                        {
-                            Ok(count) => embedded_count += count,
-                            Err(error) => {
-                                failed_count += group.len();
-                                eprintln!("Abstract batch write failed: {error}");
-                                self.index_jobs
-                                    .update(|progress| progress.error = Some(error.to_string()))
-                                    .await;
-                            }
-                        }
+                        batch_papers.extend(group);
+                        batch_vectors.extend(vectors);
                     }
                     Err(error) => {
                         failed_count += group.len();
@@ -1213,7 +1248,7 @@ impl ArxivMcpServer {
                             .await;
                     }
                 }
-                scanned += group.len();
+                scanned += group_len;
                 if scanned % 100 < EMBEDDING_BATCH_SIZE
                     || paper_id.is_some()
                     || last_progress_update.elapsed().as_secs_f64() >= 1.0
@@ -1228,6 +1263,37 @@ impl ArxivMcpServer {
                         })
                         .await;
                     last_progress_update = Instant::now();
+                }
+            }
+            if !batch_papers.is_empty() {
+                let write_started = Instant::now();
+                match crate::hybrid_pipeline::write_abstract_vectors(
+                    table,
+                    &batch_papers,
+                    batch_vectors,
+                    embedding_model,
+                )
+                .await
+                {
+                    Ok(count) => {
+                        embedded_count += count;
+                        eprintln!(
+                            "[abstract-index] persisted vectors={} elapsed_ms={}",
+                            count,
+                            write_started.elapsed().as_millis()
+                        );
+                    }
+                    Err(error) => {
+                        failed_count += batch_papers.len();
+                        eprintln!(
+                            "[abstract-index] vector write failed vectors={} elapsed_ms={}: {error}",
+                            batch_papers.len(),
+                            write_started.elapsed().as_millis()
+                        );
+                        self.index_jobs
+                            .update(|progress| progress.error = Some(error.to_string()))
+                            .await;
+                    }
                 }
             }
         }
@@ -1255,7 +1321,7 @@ impl ArxivMcpServer {
             self.index_jobs.wait_until_resumed().await;
             let table_name =
                 env::var("ARXIV_METADATA_TABLE").unwrap_or_else(|_| "arxiv_metadata".to_owned());
-            self.ensure_gpu_vector_index(&table_name, &self.embedding_model)
+            self.ensure_gpu_vector_index(&table_name, embedding_model)
                 .await?;
         }
         Ok(())
@@ -1266,6 +1332,7 @@ impl ArxivMcpServer {
         paper_id: &str,
         ctx: usize,
         token_budget: usize,
+        embedding_model: &str,
     ) -> Result<(usize, bool), Box<dyn Error + Send + Sync>> {
         let escaped_id = paper_id.replace('\'', "''");
         let mut rows = self
@@ -1315,6 +1382,7 @@ impl ArxivMcpServer {
                     chunked,
                     embedded,
                     model.as_deref(),
+                    embedding_model,
                     ctx,
                     token_budget,
                     false,
@@ -1323,7 +1391,7 @@ impl ArxivMcpServer {
             if result.1 {
                 self.ensure_gpu_vector_index(
                     crate::hybrid_pipeline::GLOBAL_CHUNK_TABLE,
-                    &self.embedding_model,
+                    embedding_model,
                 )
                 .await?;
             }
@@ -1340,6 +1408,7 @@ impl ArxivMcpServer {
         mut chunked: Option<bool>,
         mut embedded: Option<bool>,
         indexed_model: Option<&str>,
+        embedding_model: &str,
         ctx: usize,
         token_budget: usize,
         pauseable: bool,
@@ -1356,7 +1425,7 @@ impl ArxivMcpServer {
                 progress.phase = Some("checking chunks".to_owned());
             })
             .await;
-        let same_model = indexed_model == Some(self.embedding_model.as_str());
+        let same_model = indexed_model == Some(embedding_model);
         if chunked == Some(true) && !(embedded == Some(true) && same_model) {
             let safe_limit = crate::test_pipeline::effective_embedding_token_limit(
                 ctx,
@@ -1414,7 +1483,7 @@ impl ArxivMcpServer {
                 &[
                     ("chunked", "true".to_owned()),
                     ("embedded", "false".to_owned()),
-                    ("embedding_model", sql_string(&self.embedding_model)),
+                    ("embedding_model", sql_string(embedding_model)),
                     ("chunk_count", chunk_count.to_string()),
                     ("embedded_chunk_count", "0".to_owned()),
                     ("indexing_error", "NULL".to_owned()),
@@ -1423,7 +1492,7 @@ impl ArxivMcpServer {
             .await?;
         } else if embedded == Some(true) && same_model {
             let (total, _) = pipeline
-                .paper_embedding_progress(paper_id, &self.embedding_model)
+                .paper_embedding_progress(paper_id, embedding_model)
                 .await?;
             return Ok((total, true));
         } else if !same_model {
@@ -1432,7 +1501,7 @@ impl ArxivMcpServer {
                 paper_id,
                 &[
                     ("embedded", "false".to_owned()),
-                    ("embedding_model", sql_string(&self.embedding_model)),
+                    ("embedding_model", sql_string(embedding_model)),
                     ("embedded_chunk_count", "0".to_owned()),
                     ("indexing_error", "NULL".to_owned()),
                 ],
@@ -1440,27 +1509,21 @@ impl ArxivMcpServer {
             .await?;
         }
 
-        let embedder = self.embedder(&self.embedding_model)?;
+        let embedder: Arc<dyn Embedder> = Arc::from(self.embedder(embedding_model)?);
         let job_embedder = JobPausableEmbedder {
-            inner: &embedder,
-            jobs: pauseable.then_some(&self.index_jobs),
+            inner: embedder,
+            jobs: pauseable.then(|| self.index_jobs.clone()),
         };
         self.index_jobs
             .update(|progress| progress.phase = Some("embedding chunks".to_owned()))
             .await;
         let embedding = pipeline
-            .embed_paper_chunks_without_index(
-                paper_id,
-                &self.embedding_model,
-                ctx,
-                &job_embedder,
-                4,
-            )
+            .embed_paper_chunks_without_index(paper_id, embedding_model, ctx, &job_embedder, 4)
             .await;
         match embedding {
             Ok(_) => {
                 let (chunk_count, embedded_count) = pipeline
-                    .paper_embedding_progress(paper_id, &self.embedding_model)
+                    .paper_embedding_progress(paper_id, embedding_model)
                     .await?;
                 update_paper_index_state(
                     &self.table,
@@ -1468,7 +1531,7 @@ impl ArxivMcpServer {
                     &[
                         ("chunked", "true".to_owned()),
                         ("embedded", "true".to_owned()),
-                        ("embedding_model", sql_string(&self.embedding_model)),
+                        ("embedding_model", sql_string(embedding_model)),
                         ("chunk_count", chunk_count.to_string()),
                         ("embedded_chunk_count", embedded_count.to_string()),
                         ("indexing_error", "NULL".to_owned()),
@@ -1479,7 +1542,7 @@ impl ArxivMcpServer {
             }
             Err(error) => {
                 let (total, embedded_count) = pipeline
-                    .paper_embedding_progress(paper_id, &self.embedding_model)
+                    .paper_embedding_progress(paper_id, embedding_model)
                     .await?;
                 update_paper_index_state(
                     &self.table,
@@ -1487,7 +1550,7 @@ impl ArxivMcpServer {
                     &[
                         ("chunked", "true".to_owned()),
                         ("embedded", "false".to_owned()),
-                        ("embedding_model", sql_string(&self.embedding_model)),
+                        ("embedding_model", sql_string(embedding_model)),
                         ("chunk_count", total.to_string()),
                         ("embedded_chunk_count", embedded_count.to_string()),
                         ("indexing_error", sql_string(&error.to_string())),
@@ -1708,7 +1771,7 @@ impl ArxivMcpServer {
                         model,
                         candidate_limit,
                         self.embedding_ctx,
-                        &embedder,
+                        embedder.as_ref(),
                     )
                     .await
             } else {
@@ -1721,7 +1784,7 @@ impl ArxivMcpServer {
                         None,
                         candidate_limit,
                         self.embedding_ctx,
-                        &embedder,
+                        embedder.as_ref(),
                     )
                     .await
             }
@@ -1787,9 +1850,9 @@ impl ArxivMcpServer {
             .embedding_model
             .as_deref()
             .unwrap_or(&self.embedding_model);
-        if model != self.embedding_model {
+        if model != self.embedding_model && model != self.python_embedding_model {
             return Err(McpError::invalid_params(
-                "embedding_model must match the configured local embedding model",
+                "embedding_model must match a configured embedding provider",
                 None,
             ));
         }
@@ -1812,7 +1875,10 @@ impl ArxivMcpServer {
             .await
             .map_err(internal_error)?;
         let schema = metadata_table.schema().await.map_err(internal_error)?;
-        let mut models = BTreeSet::from([self.embedding_model.clone()]);
+        let mut models = BTreeSet::from([
+            self.embedding_model.clone(),
+            self.python_embedding_model.clone(),
+        ]);
         models.extend(
             schema
                 .fields()
@@ -1841,9 +1907,9 @@ impl ArxivMcpServer {
             .embedding_model
             .as_deref()
             .unwrap_or(&self.embedding_model);
-        if model != self.embedding_model {
+        if model != self.embedding_model && model != self.python_embedding_model {
             return Err(McpError::invalid_params(
-                "embedding_model must match the configured local embedding model",
+                "embedding_model must match a configured embedding provider",
                 None,
             ));
         }
@@ -2076,14 +2142,25 @@ impl ArxivMcpServer {
                 None,
             ));
         }
+        let embedding_model = args
+            .embedding_model
+            .unwrap_or_else(|| self.python_embedding_model.clone());
+        if embedding_model != self.python_embedding_model && embedding_model != self.embedding_model
+        {
+            return Err(McpError::invalid_params(
+                "embedding_model must match a configured embedding provider",
+                None,
+            ));
+        }
         let job_id = self
             .index_jobs
-            .start(paper_id.clone(), 0)
+            .start_for_model(paper_id.clone(), embedding_model.clone(), 0)
             .await
             .map_err(|error| McpError::invalid_request(error, None))?;
         let server = self.clone();
         let jobs = self.index_jobs.clone();
         let running_id = job_id.clone();
+        let selected_model = embedding_model.clone();
         tokio::spawn(async move {
             jobs.update(|progress| progress.state = "running".to_owned())
                 .await;
@@ -2095,7 +2172,10 @@ impl ArxivMcpServer {
                     heartbeat_jobs.update(|_| {}).await;
                 }
             });
-            match server.run_index_job(paper_id, token_budget, &mode).await {
+            match server
+                .run_index_job(paper_id, token_budget, &mode, &embedding_model)
+                .await
+            {
                 Ok(()) => jobs.finish("complete", None).await,
                 Err(error) => jobs.finish("failed", Some(error.to_string())).await,
             };
@@ -2105,6 +2185,7 @@ impl ArxivMcpServer {
             "job_id": running_id,
             "events_url": format!("/indexing-jobs/{running_id}/events"),
             "state": "queued",
+            "embedding_model": selected_model,
         })
         .to_string())
     }
@@ -2135,7 +2216,7 @@ impl ArxivMcpServer {
     }
 
     #[tool(
-        description = "List the configured LFM embedding model and available llama-server reranking models."
+        description = "List the configured Python and LFM embedding models and available llama-server reranking models."
     )]
     async fn list_models(&self) -> Result<String, McpError> {
         let endpoint =
@@ -2144,39 +2225,49 @@ impl ArxivMcpServer {
         if let Ok(key) = env::var("EMBEDDING_API_KEY") {
             request = request.bearer_auth(key);
         }
-        let response: ModelListResponse = request
-            .send()
-            .await
-            .map_err(internal_error)?
-            .error_for_status()
-            .map_err(internal_error)?
-            .json()
-            .await
-            .map_err(internal_error)?;
-
         let mut available = AvailableModelsResponse {
-            embedding: vec![AvailableModel {
-                id: self.embedding_model.clone(),
-                tags: vec!["embedding".to_owned(), "llama-server".to_owned()],
-            }],
+            embedding: vec![
+                AvailableModel {
+                    id: self.embedding_model.clone(),
+                    tags: vec!["embedding".to_owned(), "llama-server".to_owned()],
+                },
+                AvailableModel {
+                    id: self.python_embedding_model.clone(),
+                    tags: vec!["embedding".to_owned(), "python-server".to_owned()],
+                },
+            ],
             reranking: Vec::new(),
         };
-        for model in response.data {
-            let mut tags = model.tags;
-            if let Some(status) = model.status {
-                tags.extend(status.args);
+        let response = async {
+            request
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<ModelListResponse>()
+                .await
+        }
+        .await;
+        match response {
+            Ok(response) => {
+                for model in response.data {
+                    let mut tags = model.tags;
+                    if let Some(status) = model.status {
+                        tags.extend(status.args);
+                    }
+                    if tags.iter().any(|tag| tag.contains("reranking")) {
+                        available
+                            .reranking
+                            .push(AvailableModel { id: model.id, tags });
+                    }
+                }
             }
-            if tags.iter().any(|tag| tag.contains("reranking")) {
-                available
-                    .reranking
-                    .push(AvailableModel { id: model.id, tags });
-            }
+            Err(error) => eprintln!("Could not load llama-server reranker models: {error}"),
         }
         serde_json::to_string(&available).map_err(internal_error)
     }
 
     #[tool(
-        description = "Embed 1 to 8 document passages with the configured LFM model through llama-server."
+        description = "Embed 1 to 8 document passages with the specifically configured Python embedding model."
     )]
     async fn embed_texts(
         &self,
@@ -2198,40 +2289,33 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        let model = args.model.as_deref().unwrap_or(&self.embedding_model);
-        if model != self.embedding_model {
+        let model = args
+            .model
+            .as_deref()
+            .unwrap_or(&self.python_embedding_model);
+        if model != self.python_embedding_model {
             return Err(McpError::invalid_params(
-                "model must match the configured local embedding model",
+                "model must match the configured Python embedding model",
                 None,
             ));
         }
-        let ctx = validate_embedding_ctx(args.ctx.unwrap_or(self.embedding_ctx))?;
-        let embedder = self.embedder(model)?;
-        let embeddings = embedder
-            .embed(
-                &args.texts,
-                crate::test_pipeline::EmbeddingTask::Document,
-                ctx,
-            )
+        let embeddings = self
+            .python_embedding_client
+            .embed_documents(model, &args.texts)
             .await
             .map_err(internal_error)?;
-        if embeddings.len() != args.texts.len() {
-            return Err(internal_error(
-                "embedding service returned an unexpected number of vectors",
-            ));
-        }
         let dimensions = embeddings.first().map(Vec::len).unwrap_or(0);
         if dimensions == 0
-            || embeddings.iter().any(|embedding| {
-                embedding.len() != dimensions || embedding.iter().any(|value| !value.is_finite())
-            })
+            || embeddings
+                .iter()
+                .any(|embedding| embedding.len() != dimensions)
         {
             return Err(internal_error(
                 "embedding service returned vectors with invalid values or dimensions",
             ));
         }
         serde_json::to_string(&serde_json::json!({
-            "model": embedder.model_name(),
+            "model": model,
             "count": embeddings.len(),
             "dimensions": dimensions,
         }))
@@ -2269,9 +2353,9 @@ impl ArxivMcpServer {
                 None,
             ));
         }
-        if args.model != self.embedding_model {
+        if args.model != self.embedding_model && args.model != self.python_embedding_model {
             return Err(McpError::invalid_params(
-                "model must match the configured local embedding model",
+                "model must match a configured embedding provider",
                 None,
             ));
         }
@@ -2289,7 +2373,7 @@ impl ArxivMcpServer {
             },
         );
         let count = pipeline
-            .embed_chunk_batch(&args.chunk_ids, &args.model, ctx, &embedder)
+            .embed_chunk_batch(&args.chunk_ids, &args.model, ctx, embedder.as_ref())
             .await
             .map_err(internal_error)?;
         serde_json::to_string(&serde_json::json!({
@@ -2438,7 +2522,7 @@ impl ArxivMcpServer {
                     reranker,
                     candidate_limit,
                     ctx,
-                    &embedder,
+                    embedder.as_ref(),
                 )
                 .await
         } else {
@@ -2449,7 +2533,7 @@ impl ArxivMcpServer {
                     reranker,
                     candidate_limit,
                     ctx,
-                    &embedder,
+                    embedder.as_ref(),
                 )
                 .await
         }
@@ -2515,13 +2599,14 @@ impl ArxivMcpServer {
             .embedding_model
             .as_deref()
             .unwrap_or(&self.embedding_model);
-        if embedding_model != self.embedding_model {
+        if embedding_model != self.embedding_model && embedding_model != self.python_embedding_model
+        {
             return Err(McpError::invalid_params(
-                "embedding_model must match the configured local embedding model",
+                "embedding_model must match a configured embedding provider",
                 None,
             ));
         }
-        self.index_one_paper(paper_id, ctx, DEFAULT_CHUNK_TOKEN_BUDGET)
+        self.index_one_paper(paper_id, ctx, DEFAULT_CHUNK_TOKEN_BUDGET, embedding_model)
             .await
             .map_err(internal_error)?;
         let embedder = self.embedder(embedding_model)?;
@@ -2545,7 +2630,7 @@ impl ArxivMcpServer {
                     .map(|reranker| reranker as &dyn crate::test_pipeline::Reranker),
                 candidate_limit,
                 ctx,
-                &embedder,
+                embedder.as_ref(),
             )
             .await
             .map_err(internal_error)?;
@@ -2630,7 +2715,9 @@ impl ServerHandler for ArxivMcpServer {
 
 pub async fn run() -> Result<(), Box<dyn Error>> {
     let config: AppConfig = serde_json::from_slice(&std::fs::read("config.json")?)?;
-    if config.models.embedding.id.trim().is_empty()
+    if config.python_embedding_model.trim().is_empty()
+        || !(32..=4096).contains(&config.embedding.max_concurrent_texts)
+        || config.models.embedding.id.trim().is_empty()
         || config.models.embedding.repo.trim().is_empty()
         || config.models.embedding.path.trim().is_empty()
         || config.models.embedding.tokenizer_path.trim().is_empty()
@@ -2638,7 +2725,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             .contains(&config.models.embedding.max_tokens)
     {
         return Err(format!(
-            "models.embedding requires non-empty id, repo, path, and tokenizerPath; maxTokens must be from {} to {MAX_LFM_EMBEDDING_TOKENS}",
+            "pythonEmbeddingModel must be non-empty; embedding.maxConcurrentTexts must be from 32 to 4096; models.embedding requires non-empty id, repo, path, and tokenizerPath; maxTokens must be from {} to {MAX_LFM_EMBEDDING_TOKENS}",
             crate::test_pipeline::EMBEDDING_TOKEN_HEADROOM + 2
         )
         .into());
@@ -2704,6 +2791,11 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             "http://{}/v1/embeddings",
             SocketAddr::new(config.llama.host, config.llama.port)
         ),
+        config.python_embedding_model.clone(),
+        format!(
+            "http://{}",
+            SocketAddr::new(config.embedding.host, config.embedding.port)
+        ),
         format!("http://127.0.0.1:{}", config.embedding.port),
         format!("http://127.0.0.1:{}", config.backend.port),
         format!(
@@ -2715,7 +2807,7 @@ pub async fn run() -> Result<(), Box<dyn Error>> {
             SocketAddr::new(config.llama.host, config.llama.port)
         ),
         tokenizer,
-        Arc::new(Semaphore::new(EMBEDDING_CONCURRENCY)),
+        Arc::new(Semaphore::new(config.embedding.max_concurrent_texts)),
         index_jobs.clone(),
         index_build_progress.clone(),
     );

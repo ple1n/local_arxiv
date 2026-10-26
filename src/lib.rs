@@ -6,6 +6,7 @@ pub mod chunking;
 pub mod hybrid_pipeline;
 pub mod ingest;
 pub mod mcp_server;
+pub mod python_embedding;
 pub mod python_indexer;
 pub mod test_pipeline;
 

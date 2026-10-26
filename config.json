@@ -9,12 +9,14 @@
   },
   "embedding": {
     "host": "127.0.0.1",
-    "port": 8001
+    "port": 8001,
+    "maxConcurrentTexts": 256
   },
   "llama": {
     "host": "127.0.0.1",
     "port": 9931
   },
+  "pythonEmbeddingModel": "google/embeddinggemma-300m",
   "models": {
     "embedding": {
       "id": "LFM-Embedding-Q4KM",
