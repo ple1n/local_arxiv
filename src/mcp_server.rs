@@ -771,7 +771,7 @@ struct SearchMetadata {
     has_more: bool,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct PaperMetadata {
     title: Option<String>,
     authors: Option<String>,
@@ -1892,6 +1892,7 @@ impl ArxivMcpServer {
                 hybrid_started.elapsed().as_millis(),
                 hybrid.hits.len()
             );
+            let has_more = hybrid.hits.len() > limit;
             let mut page = hybrid.hits.into_iter().take(limit + 1).collect::<Vec<_>>();
             if semantic_only {
                 page.sort_by(|left, right| {
@@ -1901,22 +1902,27 @@ impl ArxivMcpServer {
                         .then(left.paper_id.cmp(&right.paper_id))
                 });
             }
-            let mut hits = Vec::new();
-            for hit in page {
-                let metadata = self.metadata_for_id(&hit.paper_id).await?;
-                let (snippet, snippet_truncated) =
-                    search_excerpt(&hit.text, query, SEARCH_SNIPPET_CHARS);
-                hits.push(SearchHit {
-                    paper_id: hit.paper_id,
-                    metadata,
-                    snippet,
-                    snippet_truncated,
-                    embedding_vector_f16_bits: hit.embedding_vector_f16_bits,
-                    cosine_distance: hit.cosine_distance,
-                });
-            }
-            let has_more = hits.len() > limit;
-            hits.truncate(limit);
+            page.truncate(limit);
+            let paper_ids = page
+                .iter()
+                .map(|hit| hit.paper_id.clone())
+                .collect::<Vec<_>>();
+            let metadata = self.metadata_for_ids(&paper_ids).await?;
+            let hits = page
+                .into_iter()
+                .map(|hit| {
+                    let (snippet, snippet_truncated) =
+                        search_excerpt(&hit.text, query, SEARCH_SNIPPET_CHARS);
+                    SearchHit {
+                        metadata: metadata.get(&hit.paper_id).cloned(),
+                        paper_id: hit.paper_id,
+                        snippet,
+                        snippet_truncated,
+                        embedding_vector_f16_bits: hit.embedding_vector_f16_bits,
+                        cosine_distance: hit.cosine_distance,
+                    }
+                })
+                .collect::<Vec<_>>();
             eprintln!(
                 "[embedded-search] result metadata complete returned={} has_more={has_more}",
                 hits.len()
@@ -2927,6 +2933,65 @@ impl ArxivMcpServer {
             "result": result,
         }))
         .map_err(internal_error)
+    }
+
+    async fn metadata_for_ids(
+        &self,
+        paper_ids: &[String],
+    ) -> Result<HashMap<String, PaperMetadata>, McpError> {
+        if paper_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids = paper_ids
+            .iter()
+            .map(|paper_id| sql_string(paper_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stream = self
+            .metadata_table
+            .query()
+            .only_if(format!("paper_id IN ({ids})"))
+            .select(Select::columns(&[
+                "paper_id",
+                "title",
+                "authors",
+                "abstract",
+                "categories",
+                "primary_category",
+                "doi",
+                "journal_ref",
+                "license",
+            ]))
+            .execute()
+            .await
+            .map_err(internal_error)?;
+        let mut metadata = HashMap::with_capacity(paper_ids.len());
+        while let Some(batch) = stream.next().await {
+            let batch = batch.map_err(internal_error)?;
+            for row in 0..batch.num_rows() {
+                let column = |index| -> Result<Option<String>, McpError> {
+                    string_value(batch.column(index).as_ref(), row)
+                        .map(|value| value.map(str::to_owned))
+                        .map_err(internal_error)
+                };
+                let paper_id =
+                    column(0)?.ok_or_else(|| internal_error("metadata row has null paper_id"))?;
+                metadata.insert(
+                    paper_id,
+                    PaperMetadata {
+                        title: column(1)?,
+                        authors: column(2)?,
+                        abstract_text: column(3)?,
+                        categories: column(4)?,
+                        primary_category: column(5)?,
+                        doi: column(6)?,
+                        journal_ref: column(7)?,
+                        license: column(8)?,
+                    },
+                );
+            }
+        }
+        Ok(metadata)
     }
 
     async fn metadata_for_id(&self, paper_id: &str) -> Result<Option<PaperMetadata>, McpError> {
