@@ -23,10 +23,12 @@ from urllib.request import Request, urlopen
 
 MODEL_ID = os.getenv(
     "EMBEDDING_MODEL",
-    "alexliap/Qwen3-Embedding-8B-FP8-DYNAMIC",
+    "google/embeddinggemma-2",
 )
 MAX_BODY_BYTES = 1_048_576
 MAX_TEXTS = 32
+EMBEDDING_DIMENSION = 128
+MAX_SEQUENCE_LENGTH = 8192
 
 model: Any = None
 encode_lock = Lock()
@@ -491,7 +493,7 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
 
     def do_POST(self) -> None:
-        if self.path not in {"/embed", "/index-jobs"}:
+        if self.path not in {"/embed", "/embed/query", "/embed/document", "/index-jobs"}:
             self._send_json(HTTPStatus.NOT_FOUND, {"error": "Not found"})
             return
         if self.path == "/index-jobs" and not _is_loopback_request(self):
@@ -541,11 +543,17 @@ class EmbeddingHandler(BaseHTTPRequestHandler):
                     from sentence_transformers import SentenceTransformer
 
                     model = SentenceTransformer(MODEL_ID, trust_remote_code=True)
+                    model.max_seq_length = MAX_SEQUENCE_LENGTH
+                prompt_name = (
+                    "SearchQuery" if self.path == "/embed/query" else "Document"
+                )
                 vectors = model.encode(
                     texts,
+                    prompt_name=prompt_name,
                     normalize_embeddings=True,
                     convert_to_numpy=True,
                     show_progress_bar=False,
+                    truncate_dim=EMBEDDING_DIMENSION,
                 )
         except Exception as exc:
             self.log_error("Embedding inference failed: %s", exc)
