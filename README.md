@@ -6,7 +6,13 @@ does not call the live arXiv API. The default full-text table is
 
 ## Run
 
-Build the React UI once, then start the HTTP server:
+Start the Python service first:
+
+```sh
+uv run --extra indexer --extra embedding python embedding_server.py
+```
+
+In another terminal, build the React UI once and start the backend:
 
 ```sh
 npm --prefix web install
@@ -50,10 +56,8 @@ Runtime settings are read from the root [`config.json`](./config.json):
   (default: `32`, minimum: `32`)
 - `pythonEmbeddingModel`: exact model ID for the Python provider; it must match
   the Python service's `EMBEDDING_MODEL`
-- `llama.host` and `llama.port`: existing llama-server API address, used for
-  LFM embeddings and Qwen reranking
-- `models.embedding`: configured LFM model ID, user-managed GGUF path,
-  Hugging Face tokenizer repo/path, and model token limit
+- `llama.host` and `llama.port`: existing llama-server API address for
+  Qwen reranking
 - `apiBaseUrl`: complete MCP endpoint URL used by the frontend
 
 The backend serves this runtime config to the built frontend; Vite serves the
@@ -65,6 +69,25 @@ The database path and table names remain backend environment settings:
 `ARXIV_LANCE_DB` (default `./data/arxiv_lance`), `ARXIV_LANCE_TABLE`
 (default `arxiv_full_text`), and `ARXIV_METADATA_TABLE` (default
 `arxiv_metadata`).
+
+## Built data size
+
+The built `./data` directory occupies 244G:
+
+```text
+114G    ./data/arxiv_lance/arxiv_full_text.lance
+129G    ./data/arxiv_lance/arxiv_metadata.lance
+3.1M    ./data/arxiv_lance/tmp_test_chunks_323331312e3137393536.lance
+392K    ./data/arxiv_lance/tmp_test_chunks_303830352e31383836.lance
+1.3M    ./data/arxiv_lance/tmp_test_chunks_323330382e3032393631.lance
+42M     ./data/arxiv_lance/arxiv_chunks.lance
+612M    ./data/arxiv_lance/arxiv_abstracts.lance
+244G    ./data/arxiv_lance
+244G    ./data/
+```
+
+Building abstract embeddings for 3 million abstracts completed on an NVIDIA
+GeForce RTX 2080 Ti with 6 GB of VRAM in approximately 12 hours.
 
 ## Tools
 
@@ -236,72 +259,3 @@ counts and unique `paper_id` counts before building indexes.
 The workspace `.vscode/mcp.json` registers the local HTTP endpoint with VS Code.
 Start the server separately; leaving it running keeps the same database/table
 connection alive across chat sessions.
-
-## LFM embeddings and reranking
-
-The Rust backend sends LFM embedding requests to the existing llama-server
-configured by `llama.host` and `llama.port`. It adds the model's `query: ` or
-`document: ` prompt, tokenizes locally with the configured `tokenizer.json`,
-and sends text to llama-server's `/v1/embeddings` endpoint only after verifying
-the tokenized input length. Paper chunks are split using this same tokenizer
-and include the prompt and special tokens in their measured size. The safe
-limit is the smaller of the requested `ctx`, `models.embedding.maxTokens` (512
-by default), and the model's 768-token context, minus 32 tokens of headroom.
-Over-limit direct embedding inputs are rejected rather than silently truncated.
-Pending legacy chunks are checked before embedding; oversized chunks are removed
-and regenerated with the tokenizer-safe chunker.
-Abstract vectors in `arxiv_metadata` are stored as fixed-size Float16 values;
-the model's normalized Float32 output is converted when written. IVF-PQ
-indexing and abstract vector search operate on that Float16 column. Existing
-Float32 abstract embedding columns are not migrated automatically: reset them
-with `nix develop --command cargo run --bin reset_abstract_embeddings`, then
-run abstract indexing again.
-
-Embedding requests share four scheduler permits. Abstract indexing sends batches
-of 32 papers with up to four embedding requests in flight; writes to the Lance
-table remain serialized. Embeddings are normalized in Rust. Qwen reranking
-remains on llama-server's `/rerank` endpoint.
-
-The GGUF and tokenizer are user-managed; the Rust backend does not download
-model files. Their paths and the tokenizer's Hugging Face repo are in
-`models.embedding`. If the tokenizer file is missing, startup reports a manual
-`hf download` command. For the default configuration, that command is:
-
-```sh
-hf download LiquidAI/LFM2.5-Embedding-350M tokenizer.json \
-  --local-dir /b/models/LFM2.5-Embedding-350M
-```
-
-The Rust backend uses `embedding_server.py` only for CUDA IVF-PQ index builds;
-the browser never calls this service. Start it with the `indexer` extra so the
-Python worker can open the existing Lance dataset and push build progress and
-completion events to the Rust backend. The Rust backend does not poll the worker:
-
-```sh
-uv run --extra indexer --extra embedding python embedding_server.py
-```
-
-The worker requires CUDA and fails rather than silently building the index on
-the CPU. It derives the required PQ subvector count from the vector dimension.
-Optional `/embed`, `/embed/query`, and `/embed/document` endpoints use
-Sentence Transformers and accept batches of 1 to 32 strings in `texts`.
-`/embed/query` uses the `query` prompt; `/embed/document` uses the
-`document` prompt, and `/embed` remains an alias for document encoding. The
-default model is `google/embeddinggemma-2` (override with `EMBEDDING_MODEL`),
-with an 8K-token maximum sequence length. The `embedding` extra is needed only
-when an embedding endpoint is used. Embeddings are truncated to 128 dimensions
-by default; the model is loaded lazily so index-only runs do not reserve GPU
-memory for it. The web Embed model selector dispatches the selected model
-through its provider: Python embeddings use the Python service, while the
-configured LFM model and reranking continue to use llama-server. Rust sends the
-configured `pythonEmbeddingModel` explicitly and the Python server rejects a
-mismatched model rather than silently using its default. The chunk-test `ctx`
-argument defaults to 32K, but local LFM tokenization caps each input at the
-configured model maximum. `list_models` exposes the configured LFM embedding
-model and discovers reranking models from llama-server; set `MODEL_LIST_URL`
-only when the `/v1/models` endpoint is hosted elsewhere. `RERANK_API_KEY` can
-provide bearer authentication when required.
-
-Pausing an indexing job pauses embedding batches. An IVF-PQ build already in
-progress is not interruptible; the backend rejects pause requests during that
-phase rather than reporting a paused job while GPU work continues.
