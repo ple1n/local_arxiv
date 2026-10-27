@@ -4,6 +4,8 @@ This Rust server exposes full-text queries against the local LanceDB table. It
 does not call the live arXiv API. The default full-text table is
 `arxiv_full_text` in `./data/arxiv_lance`.
 
+![](./image.png)
+
 ## Run
 
 Start the Python service first:
