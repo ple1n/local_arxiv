@@ -1,5 +1,7 @@
 # Local arXiv LanceDB MCP server
 
+Obtain files from https://huggingface.co/datasets/secemp9/arxiv-complete thats all you need.
+
 This Rust server exposes full-text queries against the local LanceDB table. It
 does not call the live arXiv API. The default full-text table is
 `arxiv_full_text` in `./data/arxiv_lance`.
